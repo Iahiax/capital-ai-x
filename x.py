@@ -139,7 +139,7 @@ class Config:
     CANARY_FORWARD_TEST_MINUTES = 30   # مدة اختبار الظل للنماذج قبل تفعيلها
 
     # Telegram Bot
-    TELEGRAM_BOT_TOKEN = "8893700308:AAE5ahpKtEenHs_Q5kVGC6zDhfb832X66YI"
+    TELEGRAM_BOT_TOKEN = "8833615675:AAE-NKK9yStPi0NAeRnbJ8p_gZLpcj_8-7E"
     TELEGRAM_CHAT_ID = "-1004325895118"
 
     # Google Gemini API
