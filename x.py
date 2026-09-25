@@ -2059,86 +2059,672 @@ class KymaConversationalAgent:
             return f"تعذر استكمال المعالجة عبر Kyma: {e}"
 
 # ==============================================================================
-# 15. الموجّه الموحد للأوامر والرسائل (Universal Message & Command Router)
+# 15. محرك النظام الرئيسي وتدوير العملات والباكتيست الموحد
 # ==============================================================================
-async def universal_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    chat = update.effective_chat
-    if not msg or not msg.text:
-        return
-
-    raw_text = msg.text.strip()
-    
-    # 1. إذا كانت الرسالة أمراً يبدأ بـ /
-    if raw_text.startswith('/'):
-        cmd = raw_text.split()[0].lower().split('@')[0]
-        TerminalLogger.info(f"استلام أمر: {cmd} من المحادثة {chat.id}")
+class MasterQuantSystem:
+    def __init__(self):
+        DuckDBWarehouse.init_database()
+        self.broker = FastCapitalBroker()
+        self.order_flow = OrderFlowEngine()
+        self.hmm = HMMRegimeClassifier()
+        self.meta_labelers = {epic: HybridMetaLabeler() for epic in Config.ACTIVE_EPICS}
+        self.canary_tester = CanaryShadowTester()
+        self.risk_mgr = AdvancedRiskAndSessionManager()
+        self.autotrade_active = False
+        self.evolution_log = []
+        self.processed_deal_ids = set()
         
-        if cmd == '/start':
-            await start_cmd(update, context)
-        elif cmd == '/autotrade_on':
-            await autotrade_on_cmd(update, context)
-        elif cmd == '/autotrade_off':
-            await autotrade_off_cmd(update, context)
-        elif cmd == '/mode_demo':
-            await mode_demo_cmd(update, context)
-        elif cmd == '/mode_live':
-            await mode_live_cmd(update, context)
-        elif cmd == '/backtest':
-            await backtest_cmd(update, context)
-        elif cmd == '/status':
-            await status_cmd(update, context)
-        elif cmd == '/health':
-            await health_cmd(update, context)
-        elif cmd == '/evolution':
-            await evolution_cmd(update, context)
-        elif cmd == '/news':
-            await news_cmd(update, context)
-        return
+        self.breakeven_applied_deals = set()
+        self.entry_timestamps = {}
+        self.slippage_history = {epic: [] for epic in Config.ACTIVE_EPICS}
+        self.suspended_epics = {}
 
-    # 2. إذا كانت رسالة محادثة عادية -> توجيهها فوراً لمحرك Kyma AI
-    await kyma_chat_handler(update, context)
+    def reconcile_closed_trades(self):
+        activities = self.broker.fetch_recent_closed_trades(limit=5)
+        for act in activities:
+            details = act.get("details") if isinstance(act.get("details"), dict) else {}
+            deal_id = act.get("dealId") or details.get("dealId")
+            
+            if deal_id and str(deal_id).strip() not in self.processed_deal_ids:
+                pnl_val = None
+                for k in ["profitAndLoss", "pnl", "profit"]:
+                    if k in act and act[k] is not None:
+                        pnl_val = float(act[k])
+                        break
+                    if k in details and details[k] is not None:
+                        pnl_val = float(details[k])
+                        break
 
-async def kyma_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    chat = update.effective_chat
-    if not msg or not msg.text:
-        return
+                epic = act.get("epic") or details.get("epic") or "EURUSD"
+                direction = act.get("direction") or details.get("direction") or "BUY"
+                
+                if pnl_val is not None:
+                    pnl = float(pnl_val)
+                    if pnl < 0:
+                        self.risk_mgr.consecutive_losses += 1
+                        TerminalLogger.filter(f"تسجيل خسارة على الصفقة {deal_id} ({epic}) بمبلغ ${pnl:.2f} (خسائر متتالية: {self.risk_mgr.consecutive_losses})")
+                        if self.risk_mgr.consecutive_losses >= 2:
+                            self.risk_mgr.trigger_cooldown()
+                    else:
+                        self.risk_mgr.consecutive_losses = 0
+                        TerminalLogger.success(f"تسجيل ربح على الصفقة {deal_id} ({epic}) بمبلغ +${pnl:.2f}")
+                    
+                    clean_id_str = str(deal_id).strip()
+                    DuckDBWarehouse.log_closed_trade(clean_id_str, str(epic), str(direction), pnl)
 
-    user_text = msg.text
-    TerminalLogger.info(f"استلام رسالة لـ Kyma من {chat.id}: {user_text[:50]}...")
-    
-    try:
-        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
-    except Exception:
-        pass
+                    recent_slips = self.slippage_history.get(str(epic), [0.0])
+                    slip = recent_slips[-1] if recent_slips else 0.0
+                    ref_price = 150.0 if "JPY" in str(epic).upper() else 1.0850
+                    pip_val = FastCapitalBroker.get_pip_value_usd(str(epic), ref_price)
+                    
+                    pos_size = float(act.get("size") or details.get("size") or 0.02)
+                    spread_cost = round(0.8 * pip_val * pos_size, 2)
+                    friction_usd = round((0.8 + slip) * pip_val * pos_size, 2)
+                    f_ratio = round((friction_usd / (abs(pnl) + friction_usd + 1e-5)) * 100.0, 1)
+                    DuckDBWarehouse.log_tca_metric(clean_id_str, str(epic), spread_cost, slip, friction_usd, f_ratio)
+                    self.canary_tester.record_shadow_prediction(0.70, pnl)
 
-    acc = system.broker.get_account_details()
-    open_pos = system.broker.get_open_positions()
-    sess = system.risk_mgr.get_dynamic_session_weights()
-    h = InternalSystemWatchdog.get_metrics()
-    in_cd, rem_cd = system.risk_mgr.is_in_cooldown()
-    _, _, season_txt = system.risk_mgr.get_seasonality_filter()
+                    self.processed_deal_ids.add(clean_id_str)
+                    self.breakeven_applied_deals.discard(clean_id_str)
+                    self.entry_timestamps.pop(clean_id_str, None)
 
-    system_ctx = {
-        "balance": acc["balance"],
-        "available": acc["available"],
-        "session": sess["session"],
-        "season_desc": season_txt,
-        "health": h,
-        "circuit_breaker": system.risk_mgr.daily_circuit_breaker_active,
-        "cooldown_msg": f"نشطة ({rem_cd} دقيقة متبقية)" if in_cd else "مستقرة",
-        "open_trades": len(open_pos),
-        "autotrade": system.autotrade_active,
-        "latency": system.broker.get_average_latency(),
-        "is_demo": system.broker.demo
-    }
+    def enforce_dynamic_trade_management(self) -> list:
+        events = []
+        open_pos = self.broker.get_open_positions()
+        open_deal_ids = set()
 
-    reply = await asyncio.to_thread(KymaConversationalAgent.ask_and_execute, user_text, system, system_ctx)
-    await reply_safe(update, context, reply)
+        for p in open_pos:
+            pos_info = p.get("position", {})
+            deal_id = str(pos_info.get("dealId", "")).strip()
+            epic = p.get("market", {}).get("epic") or p.get("epic", "")
+            direction = pos_info.get("direction")
+            entry_price = float(pos_info.get("level") or 0.0)
+            current_size = float(pos_info.get("size") or 0.0)
+            current_sl = float(pos_info.get("stopLevel") or 0.0)
+            
+            if not deal_id or not epic or entry_price <= 0:
+                continue
+
+            open_deal_ids.add(deal_id)
+
+            if deal_id not in self.entry_timestamps:
+                self.entry_timestamps[deal_id] = time.time()
+                
+            pip_mult = self.broker.get_pip_multiplier(epic)
+            current_bid = float(p.get("market", {}).get("bid") or 0.0)
+            current_offer = float(p.get("market", {}).get("offer") or 0.0)
+            
+            if current_bid <= 0 or current_offer <= 0:
+                current_bid, current_offer = self.broker.get_latest_quote(epic)
+
+            spread_pips = (current_offer - current_bid) / pip_mult if current_bid > 0 and current_offer > 0 else 0.8
+            
+            df_m1 = DuckDBWarehouse.get_cached_candles(epic, limit=50)
+            if len(df_m1) < 15:
+                atr_pips = 4.0
+            else:
+                tr = np.maximum(df_m1['high'] - df_m1['low'], 
+                                np.maximum(abs(df_m1['high'] - df_m1['close'].shift(1)), 
+                                           abs(df_m1['low'] - df_m1['close'].shift(1))))
+                atr_pips = (tr.rolling(14).mean().iloc[-1]) / pip_mult
+                if np.isnan(atr_pips) or atr_pips <= 0:
+                    atr_pips = 4.0
+
+            profit_pips = 0.0
+            if direction == "BUY" and current_bid > 0:
+                profit_pips = (current_bid - entry_price) / pip_mult
+            elif direction == "SELL" and current_offer > 0:
+                profit_pips = (entry_price - current_offer) / pip_mult
+
+            # الخروج الزمني وفق عمر النصف لنموذج أورنشتاين-أولينبيك
+            ou_half_life = AdvancedQuantMath.calculate_ou_half_life(df_m1['close'].values)
+            elapsed_minutes = (time.time() - self.entry_timestamps[deal_id]) / 60.0
+            if elapsed_minutes > (ou_half_life * 2.0) and profit_pips < 1.0:
+                if self.broker.close_position_fully(deal_id):
+                    TerminalLogger.filter(f"خروج زمني (OU Timeout) على {epic} بعد مرور {elapsed_minutes:.1f} دقيقة (الربح: {profit_pips:+.1f} Pips)")
+                    events.append(("OU_TIMEOUT_EXIT", epic, direction, entry_price, round(profit_pips, 1)))
+                    continue
+
+            # 1. نقل الوقف لنقطة الدخول (Breakeven) عند وصول الأرباح إلى 1.0 ATR
+            be_threshold = max(Config.MIN_STOP_PIPS, atr_pips * 1.0)
+            if profit_pips >= be_threshold and deal_id not in self.breakeven_applied_deals:
+                if direction == "BUY":
+                    new_sl = round(entry_price + ((spread_pips + 0.3) * pip_mult), 3 if "JPY" in epic else 5)
+                else:
+                    new_sl = round(entry_price - ((spread_pips + 0.3) * pip_mult), 3 if "JPY" in epic else 5)
+
+                success_be = self.broker.update_position_stop(deal_id, new_sl)
+                if success_be:
+                    self.breakeven_applied_deals.add(deal_id)
+                    current_sl = new_sl
+                    TerminalLogger.success(f"تأمين الأرباح (Risk-Free Breakeven) على {epic}: نقل الوقف إلى {new_sl}")
+                    events.append(("BREAKEVEN", epic, direction, new_sl, round(profit_pips, 1)))
+
+            # 2. الوقف الهيكلي المتحرك (Structural Swing-Trailing Stop) خلف الشمعة السابقة
+            elif deal_id in self.breakeven_applied_deals and len(df_m1) >= 3:
+                prev_low = df_m1['low'].iloc[-2]
+                prev_high = df_m1['high'].iloc[-2]
+
+                if direction == "BUY":
+                    structural_sl = round(prev_low - ((spread_pips + 0.3) * pip_mult), 3 if "JPY" in epic else 5)
+                    if structural_sl > max(current_sl, entry_price) and (current_bid - structural_sl) >= (Config.MIN_STOP_PIPS * pip_mult):
+                        if self.broker.update_position_stop(deal_id, structural_sl):
+                            TerminalLogger.info(f"رفع الوقف الهيكلي لزوج {epic} إلى {structural_sl}")
+                            events.append(("STRUCTURAL_TRAIL", epic, direction, structural_sl, round(profit_pips, 1)))
+                elif direction == "SELL":
+                    structural_sl = round(prev_high + ((spread_pips + 0.3) * pip_mult), 3 if "JPY" in epic else 5)
+                    if (current_sl <= 0 or structural_sl < current_sl) and (structural_sl < entry_price) and (structural_sl - current_offer) >= (Config.MIN_STOP_PIPS * pip_mult):
+                        if self.broker.update_position_stop(deal_id, structural_sl):
+                            TerminalLogger.info(f"خفض الوقف الهيكلي لزوج {epic} إلى {structural_sl}")
+                            events.append(("STRUCTURAL_TRAIL", epic, direction, structural_sl, round(profit_pips, 1)))
+
+        stale_ids = [d for d in self.entry_timestamps if d not in open_deal_ids]
+        for sid in stale_ids:
+            self.entry_timestamps.pop(sid, None)
+            self.breakeven_applied_deals.discard(sid)
+
+        return events
+
+    def enforce_swap_closure_if_needed(self):
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.hour == 21 and 50 <= now_utc.minute <= 55:
+            open_pos = self.broker.get_open_positions()
+            for p in open_pos:
+                pos_info = p.get("position", {})
+                deal_id = pos_info.get("dealId")
+                upl = float(pos_info.get("upl") or pos_info.get("profitAndLoss") or 0.0)
+                if deal_id and upl > 0:
+                    self.broker.close_position_fully(str(deal_id))
+                    TerminalLogger.success(f"[Swap Guard]: إغلاق صفقة رابحة {deal_id} بربح ${upl:.2f} لتفادي رسوم التبييت الليلية.")
+
+    def run_single_asset_backtest(self, epic: str, df: pd.DataFrame) -> dict:
+        if len(df) < 60:
+            return {"status": "بيانات غير كافية"}
+
+        d = df.copy()
+        pip_mult = self.broker.get_pip_multiplier(epic)
+        
+        tp = (d['high'] + d['low'] + d['close']) / 3
+        vwap = (tp * d['volume']).cumsum() / (d['volume'].cumsum() + 1e-8)
+        std = (tp - vwap).rolling(30).std()
+        
+        vwap_sig = pd.Series(0, index=d.index)
+        vwap_sig[d['close'] < (vwap - 2.0 * std)] = 1
+        vwap_sig[d['close'] > (vwap + 2.0 * std)] = -1
+
+        mom_sig = np.sign(d['close'].pct_change(10)).fillna(0.0)
+        smc_sig = pd.Series(0, index=d.index)
+        smc_sig[d['close'] < d['close'].shift(20).rolling(20).min()] = 1
+        smc_sig[d['close'] > d['close'].shift(20).rolling(20).max()] = -1
+
+        signals = (smc_sig * 0.40) + (vwap_sig * 0.35) + (mom_sig * 0.25)
+        pos = pd.Series(0, index=d.index)
+        pos[signals > 0.40] = 1
+        pos[signals < -0.40] = -1
+
+        trades = []
+        current_pos = 0
+        entry_price = 0.0
+
+        spread = 0.8 * pip_mult
+        equity_curve = [1000.0]
+
+        for i in range(len(d) - 1):
+            p = pos.iloc[i]
+            price = d['close'].iloc[i]
+            
+            if current_pos == 0 and p != 0:
+                current_pos = p
+                entry_price = price
+            elif current_pos != 0 and (p != current_pos or i == len(d) - 2):
+                exit_price = price
+                if current_pos == 1:
+                    raw_pips = (exit_price - entry_price - spread) / pip_mult
+                else:
+                    raw_pips = (entry_price - exit_price - spread) / pip_mult
+
+                trades.append(raw_pips > 0)
+                equity_curve.append(equity_curve[-1] * (1.0 + (raw_pips * 0.001)))
+                current_pos = p
+                entry_price = price
+
+        eq_series = pd.Series(equity_curve)
+        peak = eq_series.cummax()
+        dd = (eq_series - peak) / peak
+        max_dd = abs(float(dd.min())) * 100
+
+        total_trades = len(trades)
+        win_rate = (sum(trades) / max(1, total_trades)) * 100
+        return {
+            "return_pct": round(float((eq_series.iloc[-1] - 1000.0) / 10.0), 2),
+            "max_dd": round(max_dd, 2),
+            "win_rate": round(win_rate, 1),
+            "trades": total_trades
+        }
+
+    def scan_and_rotate_assets(self) -> dict:
+        acc = self.broker.get_account_details()
+
+        # 1. فحص قاطع الهبوط اليومي، التهدئة، ومدة التراجع
+        cb_ok, cb_msg = self.risk_mgr.check_circuit_breakers(acc["balance"])
+        if not cb_ok:
+            TerminalLogger.filter(f"حظر قاطع الهبوط: {cb_msg}")
+            return {"action": "CIRCUIT_BREAKER", "reason": cb_msg}
+
+        in_cooldown, rem_minutes = self.risk_mgr.is_in_cooldown()
+        if in_cooldown:
+            TerminalLogger.filter(f"فترة تهدئة نشطة: باقي {rem_minutes} دقيقة")
+            return {"action": "COOLDOWN", "reason": f"فترة تهدئة نشطة بعد خسارتين متتاليتين (باقي {rem_minutes} دقيقة)"}
+
+        # 2. فحص سرعة استجابة خادم الوسيط
+        avg_latency = self.broker.get_average_latency()
+        if avg_latency > Config.HALT_API_LATENCY_MS:
+            TerminalLogger.error("LATENCY_HALT", f"استجابة وسيط التداول بطيئة جداً ({avg_latency:.0f}ms > 1000ms)")
+            return {"action": "LATENCY_HALT", "reason": f"تعليق التداول: خوادم الوسيط بطيئة جداً ({avg_latency:.0f}ms > 1000ms)"}
+
+        # 3. فحص صدمات الارتباط الجماعي المفاجئ (Macro Shock)
+        shock_detected, shock_corr = CrossAssetMacroShockFilter.detect_macro_shock()
+        if shock_detected:
+            TerminalLogger.filter(f"حظر صدمة الارتباط الكلي: متوسط ارتباط السلة ({shock_corr:.2f} > {Config.MACRO_SHOCK_CORRELATION_MAX})")
+            return {"action": "MACRO_SHOCK_HALT", "reason": f"حظر صدمة الارتباط الكلي للسلة (متوسط الارتباط {shock_corr:.2f} > {Config.MACRO_SHOCK_CORRELATION_MAX})"}
+
+        # 4. فحص مواعيد السوق، الأخبار، تثبيت لندن 4PM Fix، وحماية رسوم التبييت
+        market_ok, market_msg = MarketShield.check_market_hours()
+        if not market_ok:
+            TerminalLogger.filter(f"السوق مغلق: {market_msg}")
+            return {"action": "HALT", "reason": market_msg}
+
+        fix_ok, fix_msg = MarketShield.check_london_fix_window()
+        if not fix_ok:
+            TerminalLogger.filter(f"نافذة تثبيت لندن: {fix_msg}")
+            return {"action": "LONDON_FIX_BLOCK", "reason": fix_msg}
+
+        swap_ok, swap_msg = MarketShield.check_overnight_swap_window()
+        if not swap_ok:
+            TerminalLogger.filter(f"نافذة رسوم التبييت: {swap_msg}")
+            return {"action": "SWAP_BLOCK", "reason": swap_msg}
+
+        news_block, news_msg = MarketShield.check_live_news()
+        if news_block:
+            TerminalLogger.filter(f"حظر إخباري لحظي: {news_msg}")
+            return {"action": "NEWS_BLOCK", "reason": news_msg}
+
+        # 5. فحص سقف أزواج العملات المنفردة المفتوحة
+        open_pos = self.broker.get_open_positions()
+        distinct_open_epics = set(
+            ep for ep in (p.get("market", {}).get("epic") or p.get("epic", "") for p in open_pos) if ep
+        )
+        if len(distinct_open_epics) >= Config.MAX_OPEN_POSITIONS:
+            TerminalLogger.filter(f"بلوغ سقف أزواج العملات المفتوحة: {len(distinct_open_epics)} / {Config.MAX_OPEN_POSITIONS}")
+            return {"action": "IN_POSITION", "reason": f"تم بلوغ الحد الأقصى لأزواج العملات المتزامنة ({len(distinct_open_epics)})"}
+
+        # 6. فحص صحة نموذج الظل التجريبي (Canary Shadow Test) وإعادة التدريب الذاتي عند التراجع
+        if not self.canary_tester.is_canary_healthy():
+            self.train_and_evolve()
+            return {"action": "CANARY_RECALIBRATED", "reason": "تمت إعادة تدريب النماذج بعد تراجع أداء نموذج الظل الاستباقي"}
+
+        session_info = self.risk_mgr.get_dynamic_session_weights()
+        _, min_prob_required, _ = self.risk_mgr.get_seasonality_filter()
+        curr_strengths = CurrencyStrengthMatrix.evaluate_currency_strength()
+        dxy_trend, dxy_desc, dxy_series = SyntheticDXYEngine.get_synthetic_dxy_trend()
+        
+        basket_atrs = {}
+        for ep in Config.ACTIVE_EPICS:
+            c_df = DuckDBWarehouse.get_cached_candles(ep, limit=20)
+            if len(c_df) >= 15:
+                p_mult = self.broker.get_pip_multiplier(ep)
+                tr_val = np.maximum(c_df['high'] - c_df['low'], 
+                                    np.maximum(abs(c_df['high'] - c_df['close'].shift(1)), 
+                                               abs(c_df['low'] - c_df['close'].shift(1))))
+                basket_atrs[ep] = float((tr_val.rolling(14).mean().iloc[-1]) / p_mult)
+
+        spillover_detected, spill_msg = MarketShield.check_volatility_spillover(basket_atrs)
+        if spillover_detected:
+            TerminalLogger.filter(f"حظر انتقال تقلب عابر: {spill_msg}")
+            return {"action": "VOLATILITY_SPILLOVER_HALT", "reason": spill_msg}
+
+        qualified_opportunities = []
+
+        # 7. مسح سلة العملات بالكامل
+        for epic in Config.ACTIVE_EPICS:
+            if time.time() < self.suspended_epics.get(epic, 0):
+                continue
+
+            pip_mult = self.broker.get_pip_multiplier(epic)
+            df_m1 = self.broker.fetch_live_candles(epic, resolution="MINUTE", max_bars=300)
+            if len(df_m1) < 50:
+                continue
+
+            void_ok, void_msg = MarketMicrostructureEngine.calculate_net_liquidity_void_ratio(df_m1)
+            if not void_ok:
+                TerminalLogger.filter(f"تخطي {epic}: {void_msg}")
+                continue
+
+            gh_ok, gh_ratio = MarketMicrostructureEngine.check_glosten_harris_adverse_selection(df_m1, pip_mult)
+            if not gh_ok:
+                TerminalLogger.filter(f"تخطي {epic}: تضخم السبريد بسبب ضغط الانتقاء العكسي ({gh_ratio:.2f})")
+                continue
+
+            last = df_m1.iloc[-1]
+            live_spread_pips = (last['ask_close'] - last['close']) / pip_mult
+
+            rolling_spread = ((df_m1['ask_close'] - df_m1['close']).rolling(10).mean().iloc[-1]) / pip_mult
+            if live_spread_pips > (rolling_spread * Config.SPREAD_EXPANSION_VELOCITY_MAX):
+                TerminalLogger.filter(f"تخطي {epic}: قفزة في سرعة السبريد ({live_spread_pips:.1f} Pips)")
+                continue
+
+            tr_base = np.maximum(df_m1['high'] - df_m1['low'], 
+                                np.maximum(abs(df_m1['high'] - df_m1['close'].shift(1)), 
+                                           abs(df_m1['low'] - df_m1['close'].shift(1))))
+            base_atr_pips = (tr_base.rolling(14).mean().iloc[-1]) / pip_mult
+            if np.isnan(base_atr_pips) or base_atr_pips <= 0:
+                base_atr_pips = 4.0
+
+            clean_returns = df_m1['close'].pct_change().replace([np.inf, -np.inf], np.nan).dropna().values
+            garch_sigma = AdvancedQuantMath.predict_garch_volatility(clean_returns)
+            std_sigma = (float(np.std(clean_returns)) + 1e-8) if len(clean_returns) > 0 else 1.0
+            garch_factor = np.clip(garch_sigma / std_sigma, 0.8, 1.4)
+            atr_pips = max(Config.MIN_STOP_PIPS, base_atr_pips * garch_factor)
+
+            if ((live_spread_pips / atr_pips) * 100.0) > Config.MAX_FRICTION_RATIO_PCT:
+                continue
+
+            hurst = AdvancedQuantMath.calculate_rolling_hurst(df_m1['close'].values)
+            if np.isnan(hurst) or (0.47 <= hurst <= 0.53):
+                continue
+
+            df_m1 = self.order_flow.calculate_volume_delta(df_m1)
+            regime = self.hmm.fit_predict_regime(df_m1)
+            if regime == 2:
+                continue
+
+            mtf_bias, _ = MultiTimeframeAnalyzer.get_m15_bias_from_duckdb(epic)
+
+            current_price = last['close']
+            tp = (df_m1['high'] + df_m1['low'] + df_m1['close']) / 3
+            vwap = (tp * df_m1['volume']).cumsum() / (df_m1['volume'].cumsum() + 1e-8)
+            std = (tp - vwap).rolling(30).std()
+            vwap_val = vwap.iloc[-1]
+            vwap_lower = vwap_val - (2.0 * std.iloc[-1])
+            vwap_upper = vwap_val + (2.0 * std.iloc[-1])
+
+            smc_sig = 1 if last['bullish_absorption'] else (-1 if last['bearish_absorption'] else 0)
+            vwap_sig = 1 if current_price < vwap_lower else (-1 if current_price > vwap_upper else 0)
+            mom_sig = np.sign(df_m1['close'].pct_change(10).iloc[-1])
+
+            asian_h, asian_l = DuckDBWarehouse.get_asian_range(epic)
+            sweep_dir, sweep_detail = OrderFlowEngine.detect_asian_liquidity_sweep(df_m1, asian_h, asian_l, pip_mult)
+            if sweep_dir != 0:
+                smc_sig += sweep_dir * 1.5
+
+            eq_dir, eq_detail = OrderFlowEngine.detect_eqh_eql_sweep(df_m1, pip_mult)
+            if eq_dir != 0:
+                smc_sig += eq_dir * 1.5
+
+            cvd_dir, cvd_desc = OrderFlowEngine.detect_cvd_divergence(df_m1)
+            if cvd_dir != 0:
+                mom_sig += cvd_dir * 1.5
+
+            burst_hit, burst_mag = MarketMicrostructureEngine.detect_micro_volume_burst(df_m1)
+            if burst_hit:
+                mom_sig *= 1.3
+
+            score = (smc_sig * session_info["SMC"]) + (vwap_sig * session_info["VWAP"]) + (mom_sig * session_info["MOM"])
+
+            action = None
+            if score > 0.40 and mtf_bias > 0:
+                if current_price <= (vwap_val + 1.8 * atr_pips * pip_mult):
+                    action = "BUY"
+            elif score < -0.40 and mtf_bias < 0:
+                if current_price >= (vwap_val - 1.8 * atr_pips * pip_mult):
+                    action = "SELL"
+
+            if action:
+                can_open, corr_msg = CurrencyCorrelationManager.can_open_position(open_pos, epic, action)
+                if not can_open:
+                    TerminalLogger.filter(f"حظر ارتباط: {corr_msg}")
+                    continue
+
+                if not dxy_series.empty:
+                    usd_beta = CurrencyCorrelationManager.calculate_usd_beta(df_m1['close'].pct_change().dropna().tail(15), dxy_series)
+                    if abs(usd_beta) > 2.5:
+                        continue
+
+                if not SyntheticDXYEngine.is_dxy_confluent(epic, action, dxy_trend):
+                    TerminalLogger.filter(f"تعارض مع مؤشر الدولار التجميعي على {epic}")
+                    continue
+
+                strength_ok, strength_detail = CurrencyStrengthMatrix.is_strength_aligned(epic, action, curr_strengths)
+                if not strength_ok:
+                    TerminalLogger.filter(f"تعارض مصفوفة القوة على {epic}: {strength_detail}")
+                    continue
+
+                toxic, tox_score = OrderFlowEngine.check_order_flow_toxicity(df_m1, action)
+                if toxic:
+                    TerminalLogger.filter(f"ارتفاع سمية تدفق الأوامر المعاكسة على {epic} ({tox_score:.2f})")
+                    continue
+
+                fvg_detected, fvg_detail = OrderFlowEngine.detect_fvg_confluence(df_m1, action, current_price, pip_mult)
+                if fvg_detected:
+                    score += (0.15 if action == "BUY" else -0.15)
+
+                frac_d_val = float(AdvancedQuantMath.fractional_differentiation(df_m1['close'], d=0.4).iloc[-1])
+                _, kalman_vel = AdvancedQuantMath.kalman_filter_price_velocity(df_m1['close'].tail(15).values)
+
+                meta_dict = {
+                    "close": current_price,
+                    "vol": last['volume'],
+                    "mom": df_m1['close'].pct_change(10).iloc[-1],
+                    "cvd": last['cvd_zscore'],
+                    "frac_diff": frac_d_val,
+                    "kalman_v": kalman_vel
+                }
+
+                prob_success, is_conformal = self.meta_labelers[epic].predict_conformal_probability(meta_dict)
+                if not is_conformal:
+                    TerminalLogger.filter(f"رفض عدم التيقن الإحصائي (Conformal Rejection) لزوج {epic}")
+                    continue
+
+                if prob_success >= min_prob_required:
+                    vov, vov_penalty, vov_sl_buf = AdvancedRiskAndSessionManager.calculate_vol_of_vol(df_m1, pip_mult)
+                    risk_parity_mult = AdvancedRiskAndSessionManager.calculate_risk_parity_weight(atr_pips, basket_atrs)
+                    dyn_sl = max(Config.MIN_STOP_PIPS, round(atr_pips * session_info["sl_mult"] * vov_sl_buf, 1))
+                    dyn_tp = max(Config.MIN_PROFIT_PIPS, round(atr_pips * session_info["tp_mult"], 1))
+
+                    qualified_opportunities.append({
+                        "epic": epic,
+                        "action": action,
+                        "score": abs(score),
+                        "prob": prob_success,
+                        "price": current_price,
+                        "ask_price": last['ask_close'],
+                        "sl_pips": dyn_sl,
+                        "tp_pips": dyn_tp,
+                        "hurst": round(hurst, 2),
+                        "atr_pips": atr_pips,
+                        "fvg_note": fvg_detail if fvg_detected else "لا توجد فجوة",
+                        "sweep_note": sweep_detail if sweep_dir != 0 else (eq_detail if eq_dir != 0 else "طبيعي"),
+                        "cvd_note": cvd_desc if cvd_dir != 0 else "متسق",
+                        "strength_note": strength_detail,
+                        "dxy_note": dxy_desc,
+                        "vov_penalty": vov_penalty,
+                        "risk_parity_mult": risk_parity_mult,
+                        "pip_mult": pip_mult,
+                        "df": df_m1,
+                        "vwap": vwap
+                    })
+
+        if qualified_opportunities:
+            best_opp = max(qualified_opportunities, key=lambda x: (x["prob"], x["score"]))
+            
+            vision_ok, vision_reason = KymaChartVisionValidator.validate_setup_with_vision(
+                best_opp["epic"], best_opp["df"], best_opp["vwap"], best_opp["action"], best_opp["price"]
+            )
+            
+            if not vision_ok:
+                TerminalLogger.filter(f"رفض بصري لزوج {best_opp['epic']}: {vision_reason}")
+                return {"action": "VISION_REJECTED", "reason": f"رفض بصري لزوج {best_opp['epic']}: {vision_reason}"}
+
+            if self.autotrade_active:
+                slip_cap = MarketMicrostructureEngine.get_asymmetric_slippage_cap(best_opp["epic"], best_opp["atr_pips"])
+                live_bid, live_offer = self.broker.get_latest_quote(best_opp["epic"])
+                
+                if best_opp["action"] == "BUY":
+                    target_exec_price = live_offer if live_offer > 0 else best_opp["ask_price"]
+                    drift_pips = abs(target_exec_price - best_opp["ask_price"]) / best_opp["pip_mult"]
+                else:
+                    target_exec_price = live_bid if live_bid > 0 else best_opp["price"]
+                    drift_pips = abs(target_exec_price - best_opp["price"]) / best_opp["pip_mult"]
+
+                if drift_pips > slip_cap:
+                    TerminalLogger.filter(f"انزلاق ما قبل التنفيذ لـ {best_opp['epic']} ({drift_pips:.2f} > {slip_cap:.2f} Pips)")
+                    return {"action": "PRE_TRADE_SLIPPAGE_REJECTED", "reason": f"انزلاق ما قبل التنفيذ {drift_pips:.2f} > السقف غير المتماثل {slip_cap:.2f} Pips"}
+
+                total_lots = self.risk_mgr.calculate_lot_size(
+                    best_opp["epic"], 
+                    acc["available"], 
+                    target_exec_price,
+                    best_opp["sl_pips"],
+                    avg_latency,
+                    best_opp["vov_penalty"],
+                    best_opp["risk_parity_mult"]
+                )
+
+                deal_refs = []
+                actual_prices = []
+                
+                if total_lots >= 0.02:
+                    child_lots_1 = round(total_lots / 2.0, 2)
+                    child_lots_2 = round(total_lots - child_lots_1, 2)
+
+                    res_1 = self.broker.execute_order_server_trailing(
+                        epic=best_opp["epic"],
+                        direction=best_opp["action"],
+                        size=child_lots_1,
+                        current_price=target_exec_price,
+                        stop_pips=best_opp["sl_pips"],
+                        profit_pips=max(Config.MIN_PROFIT_PIPS, best_opp["atr_pips"] * 1.5)
+                    )
+                    res_2 = self.broker.execute_order_server_trailing(
+                        epic=best_opp["epic"],
+                        direction=best_opp["action"],
+                        size=child_lots_2,
+                        current_price=target_exec_price,
+                        stop_pips=best_opp["sl_pips"],
+                        profit_pips=best_opp["tp_pips"]
+                    )
+                    res = res_1 if "dealReference" in res_1 else res_2
+                    for r_c in [res_1, res_2]:
+                        if "dealReference" in r_c:
+                            deal_refs.append(str(r_c["dealReference"]))
+                        if "level" in r_c:
+                            actual_prices.append(float(r_c["level"]))
+                else:
+                    res = self.broker.execute_order_server_trailing(
+                        epic=best_opp["epic"],
+                        direction=best_opp["action"],
+                        size=total_lots,
+                        current_price=target_exec_price,
+                        stop_pips=best_opp["sl_pips"],
+                        profit_pips=best_opp["tp_pips"]
+                    )
+                    if "dealReference" in res:
+                        deal_refs.append(str(res["dealReference"]))
+                    if "level" in res:
+                        actual_prices.append(float(res["level"]))
+
+                if not deal_refs:
+                    TerminalLogger.error("ORDER_REJECTED_BY_BROKER", str(res.get("errorCode", res)))
+                    return {"action": "ORDER_FAILED", "reason": str(res.get("errorCode", "فشل استلام مرجع التنفيذ من الوسيط"))}
+
+                actual_price = float(np.mean(actual_prices)) if actual_prices else target_exec_price
+                base_ref = best_opp["ask_price"] if best_opp["action"] == "BUY" else best_opp["price"]
+                slippage_pips = round(abs(actual_price - base_ref) / best_opp["pip_mult"], 2)
+                self.slippage_history[best_opp["epic"]].append(slippage_pips)
+                
+                slip_alert = ""
+                recent_slips = self.slippage_history[best_opp["epic"]][-2:]
+                if len(recent_slips) >= 2 and np.mean(recent_slips) > Config.MAX_ALLOWED_SLIPPAGE_PIPS:
+                    self.suspended_epics[best_opp["epic"]] = time.time() + 3600
+                    slip_alert = f"\n⚠️ **تحذير:** تكرر انزلاق التنفيذ ({np.mean(recent_slips):.2f} Pips). تم تعليق الزوج لمدة ساعة."
+                    TerminalLogger.filter(f"تعليق التداول على {best_opp['epic']} لمدة ساعة لتكرار الانزلاق.")
+
+                clean_ref = "-".join([re.sub(r'[^a-zA-Z0-9-]', '-', d_r) for d_r in deal_refs])
+
+                TerminalLogger.success(
+                    f"تنفيذ صفقة: {best_opp['action']} {total_lots} Lot على {best_opp['epic']} بسعر {actual_price} "
+                    f"(SL: {best_opp['sl_pips']} Pips, TP: {best_opp['tp_pips']} Pips, Deals: {clean_ref})"
+                )
+
+                return {
+                    "action": best_opp["action"],
+                    "epic": best_opp["epic"],
+                    "price": actual_price,
+                    "lots": total_lots,
+                    "sl_pips": best_opp["sl_pips"],
+                    "tp_pips": best_opp["tp_pips"],
+                    "prob": round(best_opp["prob"], 2),
+                    "hurst": best_opp["hurst"],
+                    "session": session_info["session"],
+                    "deal_ref": clean_ref,
+                    "fvg": best_opp["fvg_note"],
+                    "sweep": best_opp["sweep_note"],
+                    "cvd": best_opp["cvd_note"],
+                    "strength": best_opp["strength_note"],
+                    "dxy": best_opp["dxy_note"],
+                    "latency": round(avg_latency, 0),
+                    "slippage": slippage_pips,
+                    "slip_alert": slip_alert,
+                    "reason": f"اقتناص فرصة رابحة ({best_opp['epic']}) بوقف ديناميكي {best_opp['sl_pips']} نقطة"
+                }
+            else:
+                TerminalLogger.info(f"رصد إشارة دخول في وضع المراقبة: {best_opp['action']} على {best_opp['epic']} (الاحتمالية {best_opp['prob']*100:.1f}%)")
+                return {
+                    "action": "SIGNAL_DETECTED",
+                    "epic": best_opp["epic"],
+                    "price": best_opp["price"],
+                    "sl_pips": best_opp["sl_pips"],
+                    "tp_pips": best_opp["tp_pips"],
+                    "prob": round(best_opp["prob"], 2),
+                    "reason": f"فرصة ممتازة على {best_opp['epic']} ولكن التداول الآلي معطل (المراقبة فقط)"
+                }
+
+        TerminalLogger.scan("لا توجد فرص متوافقة ومستوفية للشروط اللحظية.")
+        return {"action": "HOLD", "reason": "استقرار محايد عبر كافة العملات النشطة"}
+
+    def run_full_backtest_duckdb(self) -> dict:
+        results = {}
+        for epic in Config.ACTIVE_EPICS:
+            df = DuckDBWarehouse.get_cached_candles(epic, limit=1000)
+            if len(df) >= 60:
+                results[epic] = self.run_single_asset_backtest(epic, df)
+        return results
+
+    def train_and_evolve(self) -> dict:
+        trained_epics = []
+        backtest_results = {}
+        
+        for epic in Config.ACTIVE_EPICS:
+            df = DuckDBWarehouse.get_cached_candles(epic, limit=1000)
+            if len(df) >= 60:
+                df_features = self.order_flow.calculate_volume_delta(df)
+                success, msg = self.meta_labelers[epic].train_ensemble_with_purged_cv(df_features, self.broker.get_pip_multiplier(epic))
+                if success:
+                    trained_epics.append(epic)
+                bt_metrics = self.run_single_asset_backtest(epic, df)
+                backtest_results[epic] = bt_metrics
+        
+        entry = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "status": f"تم التدريب النظيف (Purged CV + Triple Barrier) لـ: {', '.join(trained_epics) if trained_epics else 'تجميد الأوزان'}",
+            "results": backtest_results
+        }
+        self.evolution_log.append(entry)
+        TerminalLogger.success(f"اكتملت دورة التطور الساعية والباكتيست الذاتي لـ {len(trained_epics)} زوج.")
+        return entry
 
 # ==============================================================================
-# 16. أوامر التيليجرام التفاعلية المباشرة وتصنيف الأولويات
+# 16. إنشاء الكائن المشترك ومعالجات تيليجرام
 # ==============================================================================
 system = MasterQuantSystem()
 
@@ -2366,6 +2952,82 @@ async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  ↳ {market_msg}"
     )
     await reply_safe(update, context, msg)
+
+async def universal_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not msg.text:
+        return
+
+    raw_text = msg.text.strip()
+    
+    # 1. فحص الأوامر التي تبدأ بـ /
+    if raw_text.startswith('/'):
+        cmd = raw_text.split()[0].lower().split('@')[0]
+        TerminalLogger.info(f"استلام أمر: {cmd} من المحادثة {chat.id}")
+        
+        if cmd == '/start':
+            await start_cmd(update, context)
+        elif cmd == '/autotrade_on':
+            await autotrade_on_cmd(update, context)
+        elif cmd == '/autotrade_off':
+            await autotrade_off_cmd(update, context)
+        elif cmd == '/mode_demo':
+            await mode_demo_cmd(update, context)
+        elif cmd == '/mode_live':
+            await mode_live_cmd(update, context)
+        elif cmd == '/backtest':
+            await backtest_cmd(update, context)
+        elif cmd == '/status':
+            await status_cmd(update, context)
+        elif cmd == '/health':
+            await health_cmd(update, context)
+        elif cmd == '/evolution':
+            await evolution_cmd(update, context)
+        elif cmd == '/news':
+            await news_cmd(update, context)
+        return
+
+    # 2. توجيه الرسائل العادية لـ Kyma AI
+    await kyma_chat_handler(update, context)
+
+async def kyma_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not msg.text:
+        return
+
+    user_text = msg.text
+    TerminalLogger.info(f"استلام رسالة لـ Kyma من {chat.id}: {user_text[:50]}...")
+    
+    try:
+        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+    except Exception:
+        pass
+
+    acc = system.broker.get_account_details()
+    open_pos = system.broker.get_open_positions()
+    sess = system.risk_mgr.get_dynamic_session_weights()
+    h = InternalSystemWatchdog.get_metrics()
+    in_cd, rem_cd = system.risk_mgr.is_in_cooldown()
+    _, _, season_txt = system.risk_mgr.get_seasonality_filter()
+
+    system_ctx = {
+        "balance": acc["balance"],
+        "available": acc["available"],
+        "session": sess["session"],
+        "season_desc": season_txt,
+        "health": h,
+        "circuit_breaker": system.risk_mgr.daily_circuit_breaker_active,
+        "cooldown_msg": f"نشطة ({rem_cd} دقيقة متبقية)" if in_cd else "مستقرة",
+        "open_trades": len(open_pos),
+        "autotrade": system.autotrade_active,
+        "latency": system.broker.get_average_latency(),
+        "is_demo": system.broker.demo
+    }
+
+    reply = await asyncio.to_thread(KymaConversationalAgent.ask_and_execute, user_text, system, system_ctx)
+    await reply_safe(update, context, reply)
 
 # ==============================================================================
 # 17. مهام الجدولة اللحظية والساعية وتصنيف الإشعارات
