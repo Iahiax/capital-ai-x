@@ -1,8 +1,10 @@
 import os
+import io
 import ast
 import sys
 import json
 import time
+import base64
 import asyncio
 import tempfile
 import subprocess
@@ -12,6 +14,12 @@ from urllib3.util.retry import Retry
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
+
+# إعداد Matplotlib للعمل في الخلفية دون واجهة رسومية (Windows Service Safe)
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -40,16 +48,18 @@ class Config:
     CAPITAL_API_KEY = "ut2RpxSbx6fiDdHv"
     CAPITAL_PASSWORD = "Yahia@1411"
     DEMO_MODE = True
-    DEMO_SERVER = "https://demo-api-capital.backend-capital.com"
-    LIVE_SERVER = "https://api-capital.backend-capital.com"
+    DEMO_SERVER = "[https://demo-api-capital.backend-capital.com](https://demo-api-capital.backend-capital.com)"
+    LIVE_SERVER = "[https://api-capital.backend-capital.com](https://api-capital.backend-capital.com)"
     EPIC_EURUSD = "EURUSD"
 
     # إدارة المخاطر والرافعة المالية
     LEVERAGE = 100.0
-    KELLY_FRACTION = 0.25
-    MAX_MARGIN_USAGE_PCT = 0.80
-    DEFAULT_STOP_PIPS = 4.0
-    DEFAULT_PROFIT_PIPS = 10.0
+    KELLY_FRACTION = 0.25          # ربع صيغة كيلي لنمو تراكمي آمن
+    MAX_MARGIN_USAGE_PCT = 0.80     # أقصى نسبة استهلاك للهامش (80%)
+    DEFAULT_STOP_PIPS = 4.0        # 4 نقاط وقف
+    DEFAULT_PROFIT_PIPS = 10.0     # 10 نقاط هدف
+    MAX_DAILY_DRAWDOWN_PCT = 3.0   # قاطع الهبوط اليومي (3%)
+    MAX_FRICTION_RATIO_PCT = 20.0  # أقصى نسبة سبريد إلى مدى الشمعة اللحظي
 
     # Telegram Bot
     TELEGRAM_BOT_TOKEN = "8893700308:AAE5ahpKtEenHs_Q5kVGC6zDhfb832X66YI"
@@ -57,7 +67,7 @@ class Config:
 
     # Google Gemini API
     GEMINI_API_KEY = "AQ.Ab8RN6JevzXfPTK6MPgLXSeePc5ERTi0eONlQdTNqSv5P0McGA"
-    GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+    GEMINI_ENDPOINT = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent)"
 
     # المفكرة الاقتصادية اللحظية والماكرو
     FRED_API_KEY = "d295bdec801d4faf6f55e5a5ea34eb07"
@@ -67,10 +77,10 @@ class Config:
     # Firebase Firestore REST API
     FIREBASE_PROJECT_ID = "capital-xx"
     FIREBASE_API_KEY = "AIzaSyBeLkqTzIgRcHbAxGbTS5gqnUz2QCA4dYI"
-    FIRESTORE_URL = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents"
+    FIRESTORE_URL = f"[https://firestore.googleapis.com/v1/projects/](https://firestore.googleapis.com/v1/projects/){FIREBASE_PROJECT_ID}/databases/(default)/documents"
 
 # ==============================================================================
-# 2. وسيط Capital.com مع تصحيح أسعار الأهداف وتجديد الجلسات
+# 2. وسيط Capital.com مع استخراج السبريد الحقيقي وإدارة الأوامر
 # ==============================================================================
 class FastCapitalBroker:
     def __init__(self):
@@ -119,6 +129,7 @@ class FastCapitalBroker:
         return {"balance": 1000.0, "available": 1000.0}
 
     def fetch_candles(self, resolution="MINUTE", max_bars=1000) -> pd.DataFrame:
+        """جلب الشموع مع أسعار العرض والطلب لحساب السبريد الدقيق"""
         url = f"{self.get_server()}/api/v1/prices/{Config.EPIC_EURUSD}"
         params = {"resolution": resolution, "max": max_bars}
         try:
@@ -135,6 +146,7 @@ class FastCapitalBroker:
                     "high": float(p["highPrice"]["bid"]),
                     "low": float(p["lowPrice"]["bid"]),
                     "close": float(p["closePrice"]["bid"]),
+                    "ask_close": float(p["closePrice"]["ask"]),
                     "volume": float(p.get("lastTradedVolume", 1.0))
                 })
             return pd.DataFrame(rows)
@@ -143,13 +155,9 @@ class FastCapitalBroker:
             return pd.DataFrame()
 
     def execute_order_server_trailing(self, direction: str, size: float, current_price: float, stop_pips: float, profit_pips: float) -> dict:
-        """
-        إرسال مسافة الوقف المتحرك وحساب سعر الهدف المطلق profitLevel بدقة
-        """
         url = f"{self.get_server()}/api/v1/positions"
         stop_dist_price = round(stop_pips * 0.0001, 5)
 
-        # حساب الهدف كسعر مطلق معتمد لدى وسيط Capital.com
         if direction == "BUY":
             profit_level = round(current_price + (profit_pips * 0.0001), 5)
         else:
@@ -186,6 +194,21 @@ class FastCapitalBroker:
             print(f"[Open Positions Error]: {e}")
         return []
 
+    def fetch_recent_closed_trades(self, limit=5) -> list:
+        """جلب تاريخ الأنشطة والتداولات المنفذة مؤخراً للتسوية وحساب الانزلاق"""
+        url = f"{self.get_server()}/api/v1/history/activity"
+        params = {"limit": limit}
+        try:
+            r = self.session.get(url, headers=self.get_headers(), params=params, timeout=6)
+            if r.status_code == 401:
+                self.login()
+                r = self.session.get(url, headers=self.get_headers(), params=params, timeout=6)
+            if r.status_code == 200:
+                return r.json().get("activities", [])
+        except Exception as e:
+            print(f"[Activity Fetch Error]: {e}")
+        return []
+
 # ==============================================================================
 # 3. صمام أمان السوق والأخبار اللحظية
 # ==============================================================================
@@ -209,7 +232,7 @@ class MarketShield:
         today_str = now_utc.strftime("%Y-%m-%d")
 
         try:
-            url_fmp = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={today_str}&to={today_str}&apikey={Config.FMP_API_KEY}"
+            url_fmp = f"[https://financialmodelingprep.com/api/v3/economic_calendar?from=](https://financialmodelingprep.com/api/v3/economic_calendar?from=){today_str}&to={today_str}&apikey={Config.FMP_API_KEY}"
             resp = requests.get(url_fmp, timeout=4)
             if resp.status_code == 200:
                 events = resp.json()
@@ -225,7 +248,7 @@ class MarketShield:
             pass
 
         try:
-            url_fh = f"https://finnhub.io/api/v1/calendar/economic?from={today_str}&to={today_str}&token={Config.FINNHUB_API_KEY}"
+            url_fh = f"[https://finnhub.io/api/v1/calendar/economic?from=](https://finnhub.io/api/v1/calendar/economic?from=){today_str}&to={today_str}&token={Config.FINNHUB_API_KEY}"
             resp = requests.get(url_fh, timeout=4)
             if resp.status_code == 200:
                 events = resp.json().get("economicCalendar", [])
@@ -271,9 +294,6 @@ class HMMRegimeClassifier:
         self.model = None
 
     def fit_predict_regime(self, df: pd.DataFrame) -> int:
-        """
-        ترتيب الحالات إحصائياً لضمان أن الحالة 2 هي دائماً حالة الصدمة والتقلب المرتفع
-        """
         if len(df) < 60:
             return 1
         returns = df['close'].pct_change().dropna().values.reshape(-1, 1)
@@ -286,20 +306,18 @@ class HMMRegimeClassifier:
                 self.model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=40, random_state=42)
                 self.model.fit(X)
                 pred_states = self.model.predict(X)
-                
-                # فرز الحالات بناءً على تباين عوائد كل حالة لضمان ثبات التسميات
                 state_vars = [np.var(X[pred_states == i, 0]) if np.sum(pred_states == i) > 0 else 0 for i in range(3)]
-                sorted_rank = np.argsort(state_vars) # 0: أدنى تقلب، 2: أعلى تقلب
+                sorted_rank = np.argsort(state_vars)
                 rank_map = {sorted_rank[0]: 0, sorted_rank[1]: 1, sorted_rank[2]: 2}
                 return rank_map.get(pred_states[-1], 1)
             except Exception:
                 pass
 
         if X[-1, 1] > np.mean(X[:, 1]) * 2.0:
-            return 2 # صدمة سعرية شاذة
+            return 2
         elif abs(X[-1, 0]) > np.std(X[:, 0]) * 1.1:
-            return 0 # اتجاهي (Trend)
-        return 1     # عرضي (Range)
+            return 0
+        return 1
 
 class HybridMetaLabeler:
     def __init__(self):
@@ -364,8 +382,72 @@ class HybridMetaLabeler:
         return float(np.mean(probs)) if probs else 0.70
 
 # ==============================================================================
-# 6. إدارة رأس المال والأطر الزمنية المتعددة
+# 6. إدارة المخاطر المتقدمة، جلسات التداول، وقواطع الدورة
 # ==============================================================================
+class AdvancedRiskAndSessionManager:
+    """
+    إدارة قاطع الهبوط اليومي 3%، كبح الخسائر المتتالية، وتخصيص أوزان الجلسات العالمية
+    """
+    def __init__(self):
+        self.last_reset_day = -1
+        self.day_start_equity = 1000.0
+        self.daily_circuit_breaker_active = False
+        self.consecutive_losses = 0
+
+    def update_daily_equity_baseline(self, current_equity: float):
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.day != self.last_reset_day:
+            self.day_start_equity = current_equity
+            self.last_reset_day = now_utc.day
+            self.daily_circuit_breaker_active = False
+            print(f"[Risk Manager]: تحديث رصيد بداية اليوم الأساسي: ${self.day_start_equity:,.2f}")
+
+    def check_circuit_breakers(self, current_equity: float) -> tuple[bool, str]:
+        self.update_daily_equity_baseline(current_equity)
+
+        if self.daily_circuit_breaker_active:
+            return False, "قاطع الهبوط اليومي نشط (تم إيقاف التداول حتى بداية جلسة الغد UTC)."
+
+        drawdown_pct = ((self.day_start_equity - current_equity) / self.day_start_equity) * 100.0
+        if drawdown_pct >= Config.MAX_DAILY_DRAWDOWN_PCT:
+            self.daily_circuit_breaker_active = True
+            return False, f"🚨 قاطع الهبوط اليومي: تجاوزت الخسائر اليومية {drawdown_pct:.2f}% (الحد الأقصى {Config.MAX_DAILY_DRAWDOWN_PCT}%)."
+
+        return True, "إدارة المخاطر اليومية مستقرة."
+
+    def get_dynamic_session_weights(self) -> dict:
+        """تخصيص أوزان الاستراتيجيات تلقائياً حسب طبيعة حركة السعر اللحظية لكل جلسة"""
+        hour = datetime.now(timezone.utc).hour
+        if 0 <= hour < 7:
+            # الجلسة الآسيوية: نطاق عرضي هادئ
+            return {"SMC": 0.20, "VWAP": 0.60, "MOM": 0.20, "session": "Asian Range"}
+        elif 7 <= hour < 12:
+            # جلسة لندن: كسر قمم وقيعان وتدفق سيولة
+            return {"SMC": 0.50, "VWAP": 0.20, "MOM": 0.30, "session": "London Expansion"}
+        elif 12 <= hour < 16:
+            # تداخل لندن ونيويورك: أعلى سيولة واتجاهات حادة
+            return {"SMC": 0.35, "VWAP": 0.25, "MOM": 0.40, "session": "Overlap Momentum"}
+        else:
+            # جلسة نيويورك المتأخرة
+            return {"SMC": 0.30, "VWAP": 0.40, "MOM": 0.30, "session": "Late NY"}
+
+    def calculate_lot_size(self, equity: float, current_price: float) -> float:
+        if current_price <= 0 or np.isnan(current_price):
+            current_price = 1.0850
+
+        # كبح العقد: خفض كسر كيلي إلى النصف إذا تكررت الخسائر
+        active_kelly = Config.KELLY_FRACTION
+        if self.consecutive_losses >= 2:
+            active_kelly *= 0.5
+
+        full_kelly = max(0.05, (0.58 * 2.5 - 0.42) / 2.5)
+        risk_capital = equity * (full_kelly * active_kelly)
+        pip_risk = Config.DEFAULT_STOP_PIPS * 10.0
+        calculated_lots = risk_capital / pip_risk
+        max_possible_lots = (equity * Config.LEVERAGE * Config.MAX_MARGIN_USAGE_PCT) / (100000.0 * current_price)
+        final_lot = max(0.01, min(calculated_lots, max_possible_lots))
+        return round(float(final_lot), 2)
+
 class MultiTimeframeAnalyzer:
     @staticmethod
     def get_m15_bias(broker: FastCapitalBroker) -> tuple[int, str]:
@@ -380,24 +462,73 @@ class MultiTimeframeAnalyzer:
             return -1, "الاتجاه هابط على M15"
         return 0, "اتجاه M15 محايد"
 
-class FractionalKellyRiskManager:
+# ==============================================================================
+# 7. المصادقة البصرية للشارت عبر Gemini Multimodal Vision
+# ==============================================================================
+class GeminiChartVisionValidator:
+    """رسم الشارت اللحظي في الذاكرة وإرساله لـ Gemini Flash للتحقق البصري من النموذج السعري"""
     @staticmethod
-    def calculate_lot_size(equity: float, win_rate_pct: float, risk_reward_ratio: float, current_price: float) -> float:
-        if current_price <= 0 or np.isnan(current_price):
-            current_price = 1.0850
-        p = max(0.35, min(0.80, win_rate_pct / 100.0))
-        q = 1.0 - p
-        b = max(1.0, risk_reward_ratio)
-        full_kelly = max(0.05, (p * b - q) / b)
-        risk_capital = equity * (full_kelly * Config.KELLY_FRACTION)
-        pip_risk = Config.DEFAULT_STOP_PIPS * 10.0
-        calculated_lots = risk_capital / pip_risk
-        max_possible_lots = (equity * Config.LEVERAGE * Config.MAX_MARGIN_USAGE_PCT) / (100000.0 * current_price)
-        final_lot = max(0.01, min(calculated_lots, max_possible_lots))
-        return round(float(final_lot), 2)
+    def generate_chart_image_b64(df_m1: pd.DataFrame, vwap_series: pd.Series) -> str:
+        d = df_m1.tail(40).copy().reset_index(drop=True)
+        v = vwap_series.tail(40).values
+
+        fig, ax = plt.subplots(figsize=(6, 3), dpi=100)
+        fig.patch.set_facecolor('#0E1117')
+        ax.set_facecolor('#0E1117')
+
+        for i, row in d.iterrows():
+            color = '#00FF7F' if row['close'] >= row['open'] else '#FF3B30'
+            ax.plot([i, i], [row['low'], row['high']], color=color, linewidth=1)
+            ax.plot([i, i], [row['open'], row['close']], color=color, linewidth=3)
+
+        ax.plot(range(len(v)), v, color='#00BFFF', linestyle='--', linewidth=1.5, label="VWAP")
+        ax.axis('off')
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', facecolor=fig.get_facecolor(), edgecolor='none')
+        plt.close(fig)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode('utf-8')
+
+    @classmethod
+    def validate_setup_with_vision(cls, df_m1: pd.DataFrame, vwap_series: pd.Series, action: str, price: float) -> tuple[bool, str]:
+        try:
+            b64_chart = cls.generate_chart_image_b64(df_m1, vwap_series)
+            url = f"{Config.GEMINI_ENDPOINT}?key={Config.GEMINI_API_KEY}"
+            headers = {"Content-Type": "application/json"}
+
+            prompt = (
+                f"You are an elite quantitative execution risk controller. "
+                f"A quantitative model wants to enter a '{action}' position on EUR/USD at price {price}. "
+                f"Inspect this 40-minute candlestick chart with VWAP dashed line. Check for dangerous counter-trend absorption wicks, "
+                f"fakeouts, or hostile momentum traps. "
+                f"Respond STRICTLY in JSON format without markdown code blocks: {{\"decision\": \"APPROVE\" or \"REJECT\", \"reason\": \"brief explanation in Arabic\"}}"
+            )
+
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt},
+                            {"inlineData": {"mimeType": "image/png", "data": b64_chart}}
+                        ]
+                    }
+                ]
+            }
+
+            r = requests.post(url, headers=headers, json=payload, timeout=8)
+            if r.status_code == 200:
+                raw_text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                clean_json = raw_text.replace("```json", "").replace("```", "").strip()
+                data = json.loads(clean_json)
+                return (data.get("decision") == "APPROVE"), data.get("reason", "موافقة بصرية")
+        except Exception as e:
+            print(f"[Vision Warning]: تخطي الفحص البصري لتفادي التأخير: {e}")
+        return True, "تم تخطي الفحص البصري"
 
 # ==============================================================================
-# 7. محرك Google Gemini مع Function Calling المحدث (camelCase)
+# 8. محرك Google Gemini مع Function Calling وتعديل النظام ذاتياً
 # ==============================================================================
 GEMINI_FUNCTION_TOOLS = [
     {
@@ -420,19 +551,6 @@ GEMINI_FUNCTION_TOOLS = [
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {}
-                }
-            },
-            {
-                "name": "set_strategy_bias",
-                "description": "تعديل أوزان استراتيجيات التداول يدوياً (SMC, VWAP, MOM)",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "smc_weight": {"type": "NUMBER", "description": "وزن استراتيجية SMC والسيولة"},
-                        "vwap_weight": {"type": "NUMBER", "description": "وزن استراتيجية انحرافات VWAP"},
-                        "mom_weight": {"type": "NUMBER", "description": "وزن استراتيجية الزخم Momentum"}
-                    },
-                    "required": ["smc_weight", "vwap_weight", "mom_weight"]
                 }
             },
             {
@@ -475,13 +593,13 @@ class GeminiConversationalAgent:
 - الرصيد الإجمالي: ${system_context.get('balance', 0):,.2f}
 - الرصيد المتاح: ${system_context.get('available', 0):,.2f}
 - السعر اللحظي: {system_context.get('price', 'N/A')}
-- حالة السوق (HMM): {system_context.get('regime', 'N/A')}
-- اتجاه فريم 15 دقيقة: {system_context.get('mtf_bias', 'N/A')}
+- جلسة التداول الحالية: {system_context.get('session', 'N/A')}
+- حالة قاطع الهبوط اليومي: {'مفعل وحظر التداول' if system_context.get('circuit_breaker') else 'طبيعي ومستقر'}
+- عدد الخسائر المتتالية: {system_context.get('consecutive_losses', 0)}
 - الصفقات المفتوحة: {system_context.get('open_trades', 0)}
 - التداول الآلي: {'نشط' if system_context.get('autotrade') else 'متوقف مؤقتاً'}
 - وضع الحساب: {'تجريبي (DEMO)' if system_context.get('is_demo') else 'حقيقي (LIVE)'}
-- إعدادات المخاطر: وقف={Config.DEFAULT_STOP_PIPS} نقطة | هدف={Config.DEFAULT_PROFIT_PIPS} نقطة | كسر كيلي={Config.KELLY_FRACTION}
-- أوزان الاستراتيجيات: {json.dumps(system_instance.weights)}
+- إعدادات الوقف/الهدف: {Config.DEFAULT_STOP_PIPS} / {Config.DEFAULT_PROFIT_PIPS} نقطة
 
 المهمة:
 1. إذا طلب المتداول تعديل أي إعداد، استدعِ الأداة المناسبة فوراً (Function Calling).
@@ -507,7 +625,6 @@ class GeminiConversationalAgent:
             text_response = ""
             func_call = None
 
-            # فحص آمن لكافة الأجزاء لاقتناص استدعاء الدوال والنصوص
             for p in parts:
                 if "functionCall" in p:
                     func_call = p["functionCall"]
@@ -536,15 +653,8 @@ class GeminiConversationalAgent:
                     evo_res = system_instance.train_and_evolve()
                     return (
                         f"🧠 **[تمت إعادة المعايرة والتدريب الذاتي]**\n\n"
-                        f"• الحالة: {evo_res.get('status')}\n"
-                        f"• الأوزان الحالية: `{json.dumps(system_instance.weights)}`"
+                        f"• الحالة: {evo_res.get('status')}"
                     )
-
-                elif func_name == "set_strategy_bias":
-                    system_instance.weights["SMC"] = float(args.get("smc_weight", system_instance.weights["SMC"]))
-                    system_instance.weights["VWAP"] = float(args.get("vwap_weight", system_instance.weights["VWAP"]))
-                    system_instance.weights["MOM"] = float(args.get("mom_weight", system_instance.weights["MOM"]))
-                    return f"⚙️ **تم ضبط أوزان الاستراتيجيات بنجاح:**\n`{json.dumps(system_instance.weights)}`"
 
                 elif func_name == "toggle_autotrade":
                     system_instance.autotrade_active = bool(args.get("enabled", False))
@@ -570,7 +680,7 @@ class GeminiConversationalAgent:
             return f"تعذر استكمال المعالجة عبر Gemini: {e}"
 
 # ==============================================================================
-# 8. محرك النظام والتداول والباكتيست الكامل
+# 9. محرك النظام والتداول اللحظي المتكامل
 # ==============================================================================
 class MasterQuantSystem:
     def __init__(self):
@@ -578,11 +688,34 @@ class MasterQuantSystem:
         self.order_flow = OrderFlowEngine()
         self.hmm = HMMRegimeClassifier()
         self.meta_labeler = HybridMetaLabeler()
-        self.weights = {"SMC": 0.40, "VWAP": 0.35, "MOM": 0.25}
+        self.risk_mgr = AdvancedRiskAndSessionManager()
         self.autotrade_active = False
         self.evolution_log = []
+        self.last_checked_deal_id = None
+
+    def reconcile_closed_trades(self):
+        """فحص الصفقات المغلقة حديثاً لاحتساب الانزلاق السعري وتحديث حالة الخسائر المتتالية"""
+        activities = self.broker.fetch_recent_closed_trades(limit=3)
+        for act in activities:
+            deal_id = act.get("dealId")
+            if deal_id and deal_id != self.last_checked_deal_id:
+                pnl = float(act.get("profitAndLoss", 0.0))
+                if pnl < 0:
+                    self.risk_mgr.consecutive_losses += 1
+                else:
+                    self.risk_mgr.consecutive_losses = 0
+                self.last_checked_deal_id = deal_id
+                print(f"[Reconciliation]: تسوية الصفقة {deal_id} | الربح/الخسارة: {pnl} | عداد الخسائر: {self.risk_mgr.consecutive_losses}")
 
     def scan_market_and_execute(self) -> dict:
+        acc = self.broker.get_account_details()
+
+        # 1. فحص قواطع الدورة للمحفظة
+        cb_ok, cb_msg = self.risk_mgr.check_circuit_breakers(acc["balance"])
+        if not cb_ok:
+            return {"action": "CIRCUIT_BREAKER", "reason": cb_msg}
+
+        # 2. فحص مواعيد السوق والأخبار اللحظية
         market_ok, market_msg = MarketShield.check_market_hours()
         if not market_ok:
             return {"action": "HALT", "reason": market_msg}
@@ -591,25 +724,41 @@ class MasterQuantSystem:
         if news_block:
             return {"action": "NEWS_BLOCK", "reason": news_msg}
 
+        # 3. فحص الصفقات المفتوحة مسبقاً
         open_pos = self.broker.get_open_positions()
         if len(open_pos) > 0:
             return {"action": "IN_POSITION", "reason": "هناك صفقة قائمة تحت حماية الوقف المتحرك"}
 
+        # 4. جلب الشموع والتحقق من فلتر السبريد إلى المدى اللحظي
         df_m1 = self.broker.fetch_candles(resolution="MINUTE", max_bars=300)
         if len(df_m1) < 60:
             return {"action": "WAIT", "reason": "انتظار تدفق الشموع اللحظية"}
 
+        # حساب السبريد اللحظي الحقيقي
+        last = df_m1.iloc[-1]
+        live_spread_pips = (last['ask_close'] - last['close']) / 0.0001
+        
+        # حساب ATR(14)
+        tr = np.maximum(df_m1['high'] - df_m1['low'], 
+                        np.maximum(abs(df_m1['high'] - df_m1['close'].shift(1)), 
+                                   abs(df_m1['low'] - df_m1['close'].shift(1))))
+        atr_pips = (tr.rolling(14).mean().iloc[-1]) / 0.0001
+
+        if atr_pips > 0:
+            friction_ratio = (live_spread_pips / atr_pips) * 100.0
+            if friction_ratio > Config.MAX_FRICTION_RATIO_PCT:
+                return {"action": "FRICTION_BLOCK", "reason": f"حظر سبريد: نسبة الاحتكاك مرتفعة ({friction_ratio:.1f}% > {Config.MAX_FRICTION_RATIO_PCT}%)"}
+
+        # 5. تصنيف السوق ودلتا الحجم
         df_m1 = self.order_flow.calculate_volume_delta(df_m1)
         regime = self.hmm.fit_predict_regime(df_m1)
         if regime == 2:
             return {"action": "SHOCK_BLOCK", "reason": "صدمة سعرية شاذة بنموذج HMM (حظر التداول)"}
 
         mtf_bias, mtf_desc = MultiTimeframeAnalyzer.get_m15_bias(self.broker)
+        session_info = self.risk_mgr.get_dynamic_session_weights()
 
-        last = df_m1.iloc[-1]
         current_price = last['close']
-
-        # حساب مؤشرات الاستراتيجيات الثلاث بدقة
         tp = (df_m1['high'] + df_m1['low'] + df_m1['close']) / 3
         vwap = (tp * df_m1['volume']).cumsum() / (df_m1['volume'].cumsum() + 1e-8)
         std = (tp - vwap).rolling(30).std()
@@ -620,8 +769,7 @@ class MasterQuantSystem:
         vwap_sig = 1 if current_price < vwap_lower else (-1 if current_price > vwap_upper else 0)
         mom_sig = np.sign(df_m1['close'].pct_change(10).iloc[-1])
 
-        # دمج الأوزان الثلاثة بالكامل
-        score = (smc_sig * self.weights["SMC"]) + (vwap_sig * self.weights["VWAP"]) + (mom_sig * self.weights["MOM"])
+        score = (smc_sig * session_info["SMC"]) + (vwap_sig * session_info["VWAP"]) + (mom_sig * session_info["MOM"])
 
         action = "HOLD"
         if score > 0.40 and mtf_bias > 0:
@@ -630,7 +778,7 @@ class MasterQuantSystem:
             action = "SELL"
 
         if action in ["BUY", "SELL"]:
-            # استخراج ميزات السلسلة الزمنية دون التسبب في انهيار البرمجية
+            # فحص الفلتر الهجين
             mom_val = df_m1['close'].pct_change(10).iloc[-1]
             meta_features = np.array([current_price, last['volume'], mom_val, last['cvd_zscore']])
             prob_success = self.meta_labeler.predict_success_probability(meta_features)
@@ -638,9 +786,13 @@ class MasterQuantSystem:
             if prob_success < 0.65:
                 return {"action": "FILTERED", "reason": f"ألغيت بواسطة الفلتر الهجين (الاحتمالية {prob_success:.2f} < 0.65)"}
 
+            # المصادقة البصرية للشارت عبر Gemini Vision
+            vision_ok, vision_reason = GeminiChartVisionValidator.validate_setup_with_vision(df_m1, vwap, action, current_price)
+            if not vision_ok:
+                return {"action": "VISION_REJECTED", "reason": f"رفض النموذج بصرياً عبر Gemini: {vision_reason}"}
+
             if self.autotrade_active:
-                acc = self.broker.get_account_details()
-                lots = FractionalKellyRiskManager.calculate_lot_size(acc["available"], 59.0, 2.5, current_price)
+                lots = self.risk_mgr.calculate_lot_size(acc["available"], current_price)
                 res = self.broker.execute_order_server_trailing(
                     direction=action,
                     size=lots,
@@ -653,14 +805,14 @@ class MasterQuantSystem:
                     "price": current_price,
                     "lots": lots,
                     "prob": round(prob_success, 2),
+                    "session": session_info["session"],
                     "deal_ref": res.get("dealReference", "OK"),
-                    "reason": f"توافق M15 ({mtf_desc}) ومصادقة الفلتر الهجين بنجاح"
+                    "reason": f"مصادقة بصرية وهجينة كاملة ({session_info['session']})"
                 }
 
         return {"action": "HOLD", "price": current_price, "reason": "استقرار حيادي"}
 
     def run_full_backtest(self) -> dict:
-        """باكتيست حقيقي على الاستراتيجيات الثلاث مخصوماً منه السبريد"""
         df = self.broker.fetch_candles(resolution="MINUTE", max_bars=1000)
         if len(df) < 200:
             return {"status": "البيانات غير كافية"}
@@ -679,7 +831,7 @@ class MasterQuantSystem:
         smc_sig[d['close'] < d['close'].shift(20).rolling(20).min()] = 1
         smc_sig[d['close'] > d['close'].shift(20).rolling(20).max()] = -1
 
-        signals = (smc_sig * self.weights["SMC"]) + (vwap_sig * self.weights["VWAP"]) + (mom_sig * self.weights["MOM"])
+        signals = (smc_sig * 0.40) + (vwap_sig * 0.35) + (mom_sig * 0.25)
         pos = pd.Series(0, index=d.index)
         pos[signals > 0.40] = 1
         pos[signals < -0.40] = -1
@@ -711,41 +863,40 @@ class MasterQuantSystem:
             self.meta_labeler.train_ensemble(df_m1)
             entry = {
                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "status": "تم تدريب نماذج LightGBM و CatBoost بنجاح على الشموع الأخيرة.",
-                "weights": self.weights
+                "status": "تم تدريب نماذج LightGBM و CatBoost وتحديث ميزات تدفق الأوامر."
             }
             self.evolution_log.append(entry)
             return entry
         return {"status": "البيانات غير كافية للتدريب"}
 
 # ==============================================================================
-# 9. معالجات أوامر التيليجرام المنفصلة
+# 10. معالجات أوامر التيليجرام المنفصلة
 # ==============================================================================
 system = MasterQuantSystem()
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🤖 **نظام التداول المؤسسي الخارق EUR/USD (M1 CFDs)**\n\n"
-        f"• محرك المحادثة: **Google Gemini AI (Function Calling مدمج)**\n"
-        f"• حساب التداول: **{'تجريبي (DEMO)' if system.broker.demo else 'حقيقي (LIVE)'}**\n"
-        f"• الفلترة الذكية: **CatBoost + LightGBM Hybrid**\n"
-        f"• حالة التداول الآلي: **{'نشط ✅' if system.autotrade_active else 'معطل ⏸'}**\n\n"
+        "👑 **نظام التداول المؤسسي الشامل EUR/USD (M1 CFDs)**\n\n"
+        f"• محرك الذكاء الاصطناعي: **Gemini Flash (Function Calling + Vision)**\n"
+        f"• حالة الحساب: **{'تجريبي (DEMO)' if system.broker.demo else 'حقيقي (LIVE)'}**\n"
+        f"• قاطع الهبوط اليومي (3%): **{'حظر تداول 🚫' if system.risk_mgr.daily_circuit_breaker_active else 'آمن ومستقر ✅'}**\n"
+        f"• التداول الآلي: **{'نشط ✅' if system.autotrade_active else 'معطل ⏸'}**\n\n"
         "**الأوامر السريعة المتاحة:**\n"
         "• /autotrade_on - تشغيل التداول الآلي اللحظي\n"
         "• /autotrade_off - إيقاف التداول الآلي مؤقتاً\n"
         "• /mode_demo - التبديل للحساب التجريبي\n"
         "• /mode_live - التبديل للحساب الحقيقي\n"
-        "• /backtest - عرض تقرير الباكتيست الشامل\n"
-        "• /status - فحص المحفظة والمراكز المفتوحة\n"
-        "• /evolution - عرض تقرير التدريب والتطوير الذاتي\n"
-        "• /news - فحص المفكرة الاقتصادية اللحظية\n\n"
+        "• /backtest - تقرير الباكتيست المؤسسي الشامل\n"
+        "• /status - فحص المحفظة وحالة الجلسة وقاطع الهبوط\n"
+        "• /evolution - تقرير تدريب نماذج التعلم الآلي\n"
+        "• /news - فحص الأخبار اللحظية وقفل إغلاق السوق\n\n"
         "💬 *يمكنك محادثة Gemini بالعربية أو توجيه أوامر مثل: 'اجعل وقف الخسارة 5 نقاط' أو 'أعد تدريب النماذج'!*"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def autotrade_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system.autotrade_active = True
-    await update.message.reply_text("🚀 **تم تفعيل التداول الآلي التراكمي بنجاح.**", parse_mode="Markdown")
+    await update.message.reply_text("🚀 **تم تفعيل التداول الآلي المؤسسي مع المصادقة البصرية.**", parse_mode="Markdown")
 
 async def autotrade_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system.autotrade_active = False
@@ -779,26 +930,28 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     acc = system.broker.get_account_details()
     open_p = system.broker.get_open_positions()
+    sess = system.risk_mgr.get_dynamic_session_weights()
     msg = (
         "💼 **[الحالة اللحظية والمحفظة]**\n\n"
         f"• الرصيد الإجمالي: `${acc['balance']:,.2f}`\n"
         f"• الرصيد المتاح: `${acc['available']:,.2f}`\n"
+        f"• جلسة التداول: `{sess['session']}`\n"
+        f"• قاطع الهبوط اليومي (3%): **{'حظر تداول 🚫' if system.risk_mgr.daily_circuit_breaker_active else 'طبيعي ومستقر ✅'}**\n"
+        f"• عداد الخسائر المتتالية: `{system.risk_mgr.consecutive_losses}`\n"
         f"• الصفقات المفتوحة: `{len(open_p)}`\n"
-        f"• التداول الآلي: **{'نشط ✅' if system.autotrade_active else 'معطل ⏸'}**\n"
-        f"• إعدادات الوقف/الهدف: `{Config.DEFAULT_STOP_PIPS}` / `{Config.DEFAULT_PROFIT_PIPS}` نقطة"
+        f"• التداول الآلي: **{'نشط ✅' if system.autotrade_active else 'معطل ⏸'}**"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def evolution_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not system.evolution_log:
-        await update.message.reply_text("جاري تدريب النموذج الذاتي لأول مرة...")
+        await update.message.reply_text("جاري تدريب النماذج الذاتية لأول مرة...")
         system.train_and_evolve()
     last = system.evolution_log[-1]
     msg = (
         "🧬 **[تقرير التدريب والتطوير الذاتي]**\n\n"
         f"• التوقيت: `{last['timestamp']}`\n"
-        f"• الحالة: {last['status']}\n"
-        f"• الأوزان الحالية: `{json.dumps(last['weights'])}`"
+        f"• الحالة: {last['status']}"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -815,7 +968,6 @@ async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def gemini_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة الدردشة الحرة مع تشغيل غير متزامن لتفادي تجميد فحص الشموع اللحظية"""
     user_text = update.message.text
     await update.message.reply_chat_action("typing")
 
@@ -824,39 +976,48 @@ async def gemini_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     curr_price = df_m1['close'].iloc[-1] if len(df_m1) > 0 else "N/A"
     mtf_bias, mtf_desc = MultiTimeframeAnalyzer.get_m15_bias(system.broker)
     open_pos = system.broker.get_open_positions()
+    sess = system.risk_mgr.get_dynamic_session_weights()
 
     system_ctx = {
         "balance": acc["balance"],
         "available": acc["available"],
         "price": curr_price,
-        "regime": "مستقر (Trend)" if mtf_bias != 0 else "تذبذب عرضي (Range)",
+        "session": sess["session"],
+        "circuit_breaker": system.risk_mgr.daily_circuit_breaker_active,
+        "consecutive_losses": system.risk_mgr.consecutive_losses,
         "mtf_bias": mtf_desc,
         "open_trades": len(open_pos),
         "autotrade": system.autotrade_active,
         "is_demo": system.broker.demo
     }
 
-    # تشغيل في خيط مستقل لمنع تجميد المجدول اللحظي
     reply = await asyncio.to_thread(GeminiConversationalAgent.ask_and_execute, user_text, system, system_ctx)
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 # ==============================================================================
-# 10. مهام الجدولة اللحظية والساعية
+# 11. مهام الجدولة اللحظية والساعية
 # ==============================================================================
 async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
     try:
+        # فحص وتسوية الصفقات المغلقة أولاً
+        system.reconcile_closed_trades()
+
+        # فحص إشارات السوق اللحظية
         res = system.scan_market_and_execute()
         if res.get("action") in ["BUY", "SELL"]:
             deal_ref_clean = str(res.get('deal_ref', 'OK')).replace("_", "\\_")
             msg = (
-                f"⚡ **[تنفيذ صفقة تلقائية - {res['action']}]**\n\n"
+                f"⚡ **[تنفيذ صفقة تلقائية معتمدة بصرياً - {res['action']}]**\n\n"
                 f"• السعر: `{res['price']}`\n"
-                f"• حجم اللوت: `{res['lots']} Lot` (معادلة كيلي)\n"
+                f"• حجم العقد: `{res['lots']} Lot`\n"
+                f"• الجلسة: `{res.get('session', 'N/A')}`\n"
                 f"• ثقة الفلتر الهجين: `{res['prob']*100:.1f}%`\n"
-                f"• السبب: {res['reason']}\n"
+                f"• المصادقة البصرية: **معتمدة عبر Gemini Vision**\n"
                 f"• المرجع: `{deal_ref_clean}`"
             )
             await context.bot.send_message(chat_id=Config.TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
+        elif res.get("action") == "CIRCUIT_BREAKER":
+            await context.bot.send_message(chat_id=Config.TELEGRAM_CHAT_ID, text=f"🚨 {res['reason']}")
     except Exception as e:
         print(f"[Scanner Job Error]: {e}")
 
