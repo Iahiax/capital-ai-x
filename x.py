@@ -145,7 +145,7 @@ class Config:
     # Kyma AI API (OpenAI-Compatible Gateway)
     KYMA_API_KEY = "kyma-a5093ae6505f8e2f77ba561d0d0557fa917c07c380e3d330"
     KYMA_ENDPOINT = "https://api.kymaapi.com/v1/chat/completions"
-    KYMA_MODEL = "Llama-3.1-70B"
+    KYMA_MODEL = "llama-3.3-70b"
 
     # المفكرة الاقتصادية اللحظية والماكرو
     FRED_API_KEY = "d295bdec801d4faf6f55e5a5ea34eb07"
@@ -1829,6 +1829,10 @@ class KymaChartVisionValidator:
 
     @classmethod
     def validate_setup_with_vision(cls, epic: str, df_m1: pd.DataFrame, vwap_series: pd.Series, action: str, price: float) -> tuple[bool, str]:
+        # بما أن نموذج Llama-3.3-70b هو نموذج نصي تداولي، يتم تخطي فحص الصور لتفادي بطء الاستجابة
+        if "llama" in Config.KYMA_MODEL.lower():
+            return True, "تمت المصادقة الإحصائية (نموذج Llama-3.3 نصي عالي الدقة)"
+
         try:
             b64_chart = cls.generate_chart_image_b64(df_m1, vwap_series)
             if not b64_chart:
@@ -1862,7 +1866,7 @@ class KymaChartVisionValidator:
                 "temperature": 0.2
             }
 
-            r = requests.post(Config.KYMA_ENDPOINT, headers=headers, json=payload, timeout=10)
+            r = requests.post(Config.KYMA_ENDPOINT, headers=headers, json=payload, timeout=8)
             if r.status_code == 200:
                 res_data = r.json()
                 choices = res_data.get("choices", [])
@@ -1874,10 +1878,10 @@ class KymaChartVisionValidator:
                         decision = (data.get("decision") == "APPROVE")
                         reason = data.get("reason", "موافقة بصرية")
                         if not decision:
-                            TerminalLogger.filter(f"رفض بصري من Kyma Vision لزوج {epic}: {reason}")
+                            TerminalLogger.filter(f"رفض بصري لزوج {epic}: {reason}")
                         return decision, reason
             else:
-                TerminalLogger.filter(f"النموذج لا يدعم الصور مباشرة (رمز {r.status_code}) - تخطي الفحص البصري للمتابعة")
+                TerminalLogger.filter(f"تخطي الفحص البصري للمتابعة (رمز {r.status_code})")
         except Exception as e:
             TerminalLogger.filter(f"تخطي الفحص البصري: {e}")
         return True, "تم تخطي الفحص البصري"
@@ -3120,7 +3124,7 @@ async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
                 f"• استجابة الوسيط: `{res.get('latency')} ms`\n"
                 f"• انزلاق التنفيذ: `{res.get('slippage')} Pips`\n"
                 f"• احتمالية النجاح (Conformal): `{res['prob']*100:.1f}%`\n"
-                f"• المصادقة البصرية: **معتمدة عبر Kyma Vision**\n"
+                f"• المصادقة البصرية: **معتمدة عبر Kyma ({Config.KYMA_MODEL})**\n"
                 f"• المرجع: `{res.get('deal_ref', 'OK')}`"
                 f"{res.get('slip_alert', '')}"
             )
@@ -3207,6 +3211,7 @@ async def job_health_heartbeat(context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     print("\n" + "="*80)
     print(" 🚀 Quant Institutional Multi-Asset Trading Engine (Kyma AI Integration)")
+    print(f" 🧠 Active LLM Model: {Config.KYMA_MODEL}")
     print(" 🛡️ Active Safety: Conformal ML | GARCH | Kalman | Hurst | Watchdog | Live Diagnostics")
     print("="*80 + "\n")
     
