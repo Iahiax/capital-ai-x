@@ -18,10 +18,11 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
-# ضبط Matplotlib للعمل في الخلفية دون واجهات رسومية (Windows Service Safe)
+# إعداد Matplotlib النقي للخلفية بدون الاعتماد على حالة pyplot العامة (100% Thread-Safe)
 import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 # مستودع البيانات المحلي ومراقبة النظام
 import duckdb
@@ -75,6 +76,8 @@ class Config:
     
     MAX_DAILY_DRAWDOWN_PCT = 3.0   # قاطع الهبوط اليومي (3%)
     MAX_FRICTION_RATIO_PCT = 20.0  # أقصى نسبة سبريد إلى مدى الشمعة اللحظي
+    SPREAD_EXPANSION_VELOCITY_MAX = 1.5  # حظر التنفيذ إذا تضاعف السبريد فجأة بـ 50%
+    PSI_DRIFT_THRESHOLD = 0.25     # سقف استقرار التوزيع الإحصائي PSI لمنع فرط التخصيص
 
     # Telegram Bot
     TELEGRAM_BOT_TOKEN = "8893700308:AAE5ahpKtEenHs_Q5kVGC6zDhfb832X66YI"
@@ -93,7 +96,7 @@ class Config:
     DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market_warehouse.duckdb")
 
 # ==============================================================================
-# 2. مستودع البيانات المحلي فائق السرعة عبر DuckDB (تزامن آمن)
+# 2. مستودع البيانات المحلي فائق السرعة عبر DuckDB (تزامن آمن وجداول الصفقات)
 # ==============================================================================
 class DuckDBWarehouse:
     _db_lock = threading.Lock()
@@ -114,7 +117,14 @@ class DuckDBWarehouse:
                         ask_close DOUBLE,
                         volume DOUBLE,
                         PRIMARY KEY (epic, timestamp)
-                    )
+                    );
+                    CREATE TABLE IF NOT EXISTS closed_trades (
+                        deal_id VARCHAR PRIMARY KEY,
+                        epic VARCHAR,
+                        direction VARCHAR,
+                        pnl DOUBLE,
+                        close_time VARCHAR
+                    );
                 """)
             finally:
                 con.close()
@@ -142,6 +152,30 @@ class DuckDBWarehouse:
                 """)
             finally:
                 con.close()
+
+    @classmethod
+    def log_closed_trade(cls, deal_id: str, epic: str, direction: str, pnl: float):
+        with cls._db_lock:
+            con = duckdb.connect(Config.DB_FILE)
+            try:
+                now_str = datetime.now(timezone.utc).isoformat()
+                con.execute("""
+                    INSERT INTO closed_trades (deal_id, epic, direction, pnl, close_time)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (deal_id) DO NOTHING
+                """, [deal_id, epic, direction, pnl, now_str])
+            finally:
+                con.close()
+
+    @classmethod
+    def get_recent_closed_trades(cls, limit=30) -> pd.DataFrame:
+        with cls._db_lock:
+            con = duckdb.connect(Config.DB_FILE)
+            try:
+                df = con.execute(f"SELECT * FROM closed_trades ORDER BY close_time DESC LIMIT {limit}").df()
+            finally:
+                con.close()
+            return df
 
     @classmethod
     def get_cached_candles(cls, epic: str, limit=1000) -> pd.DataFrame:
@@ -311,6 +345,18 @@ class FastCapitalBroker:
         except Exception as e:
             return {"error": str(e)}
 
+    def close_position_immediately(self, deal_id: str) -> bool:
+        url = f"{self.get_server()}/api/v1/positions/{deal_id}"
+        try:
+            r = self.session.delete(url, headers=self.get_headers(), timeout=6)
+            if r.status_code == 401:
+                self.login()
+                r = self.session.delete(url, headers=self.get_headers(), timeout=6)
+            return r.status_code in [200, 204]
+        except Exception as e:
+            print(f"[Close Position Error - {deal_id}]: {e}")
+            return False
+
     def get_open_positions(self) -> list:
         url = f"{self.get_server()}/api/v1/positions"
         try:
@@ -358,7 +404,6 @@ class CurrencyCorrelationManager:
             pos_epic = pos.get("market", {}).get("epic") or pos.get("epic", "")
             pos_dir = pos.get("position", {}).get("direction") or pos.get("direction", "")
             
-            # منع فتح صفقتين على نفس الزوج نهائياً
             if pos_epic == proposed_epic:
                 return False, f"يوجد مركز مفتوح بالفعل على الزوج {pos_epic}."
 
@@ -369,7 +414,7 @@ class CurrencyCorrelationManager:
         return True, "انكشاف العملة متوازن"
 
 # ==============================================================================
-# 6. صمام أمان السوق والأخبار اللحظية متعدد العملات
+# 6. صمام أمان السوق، الأخبار، وحماية رسوم التبييت (Overnight Swap Guard)
 # ==============================================================================
 class MarketShield:
     RELEVANT_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "AUD"]
@@ -386,6 +431,14 @@ class MarketShield:
         if weekday == 6 and hour < 21:
             return False, "سوق الفوركس مغلق (بانتظار افتتاح الأحد 21:00 UTC)."
         return True, "السوق مفتوح والسيولة متاحة."
+
+    @staticmethod
+    def check_overnight_swap_window() -> tuple[bool, str]:
+        now_utc = datetime.now(timezone.utc)
+        minute_of_day = now_utc.hour * 60 + now_utc.minute
+        if 1290 <= minute_of_day <= 1335:
+            return False, "حظر التبييت: تجنب فتح صفقات خلال فترة احتساب رسوم التمويل الليلي (21:30 - 22:15 UTC)."
+        return True, "خارج نافذة رسوم التبييت."
 
     @classmethod
     def check_live_news(cls) -> tuple[bool, str]:
@@ -432,7 +485,7 @@ class MarketShield:
         return False, "لا توجد أخبار عالية التأثير في النافذة اللحظية."
 
 # ==============================================================================
-# 7. محرك تدفق الأوامر ودلتا الحجم ونماذج التعلم الآلي
+# 7. محرك تدفق الأوامر، الحجم، وفحص استقرار التوزيع الإحصائي (PSI)
 # ==============================================================================
 class OrderFlowEngine:
     @staticmethod
@@ -482,6 +535,31 @@ class HMMRegimeClassifier:
             return 0
         return 1
 
+class PopulationStabilityIndex:
+    @staticmethod
+    def calculate_psi(expected: np.ndarray, actual: np.ndarray, num_bins=5) -> float:
+        try:
+            if len(expected) < 30 or len(actual) < 30:
+                return 0.0
+            quantiles = np.linspace(0, 100, num_bins + 1)
+            bin_edges = np.percentile(expected, quantiles)
+            bin_edges = np.unique(bin_edges)
+            if len(bin_edges) < 2:
+                return 0.0
+            bin_edges[0] -= 1e-5
+            bin_edges[-1] += 1e-5
+
+            exp_counts = np.histogram(expected, bins=bin_edges)[0] + 1e-4
+            act_counts = np.histogram(actual, bins=bin_edges)[0] + 1e-4
+
+            exp_pct = exp_counts / np.sum(exp_counts)
+            act_pct = act_counts / np.sum(act_counts)
+
+            psi = np.sum((act_pct - exp_pct) * np.log(act_pct / exp_pct))
+            return float(psi)
+        except Exception:
+            return 0.0
+
 class HybridMetaLabeler:
     FEATURE_NAMES = ["close", "vol", "mom", "cvd"]
 
@@ -490,9 +568,10 @@ class HybridMetaLabeler:
         self.cb_model = None
         self.is_trained = False
 
-    def train_ensemble(self, df_m1: pd.DataFrame, pip_mult: float):
-        if len(df_m1) < 120:
-            return
+    def train_ensemble_with_psi(self, df_m1: pd.DataFrame, pip_mult: float) -> tuple[bool, str]:
+        if len(df_m1) < 150:
+            return False, "بيانات غير كافية للتدريب"
+        
         d = df_m1.copy().dropna()
         future_ret = d['close'].pct_change(3).shift(-3)
         spread_cost = (0.8 * pip_mult) / d['close']
@@ -505,8 +584,16 @@ class HybridMetaLabeler:
             "cvd": d.get('cvd_zscore', pd.Series(0, index=d.index))
         }).iloc[:-3].fillna(0.0)
 
+        split_idx = int(len(features) * 0.70)
+        ref_features = features['mom'].iloc[:split_idx].values
+        curr_features = features['mom'].iloc[split_idx:].values
+        psi_score = PopulationStabilityIndex.calculate_psi(ref_features, curr_features)
+
+        if psi_score > Config.PSI_DRIFT_THRESHOLD and self.is_trained:
+            return False, f"تجميد التدريب: رصد انجراف إحصائي للسوق (PSI = {psi_score:.3f} > {Config.PSI_DRIFT_THRESHOLD})"
+
         if len(y) < 60 or len(np.unique(y)) < 2:
-            return
+            return False, "تنوع الإشارات غير كافٍ"
 
         if lgb is not None:
             try:
@@ -523,6 +610,7 @@ class HybridMetaLabeler:
                 pass
 
         self.is_trained = (self.lgb_model is not None or self.cb_model is not None)
+        return True, f"اكتمل التدريب بنجاح (PSI = {psi_score:.3f})"
 
     def predict_success_probability(self, feature_row: np.ndarray) -> float:
         if not self.is_trained:
@@ -545,7 +633,7 @@ class HybridMetaLabeler:
         return float(np.mean(probs)) if probs else 0.70
 
 # ==============================================================================
-# 8. إدارة المخاطر، الجلسات، وتحليل M15 بدون استهلاك شبكة
+# 8. إدارة المخاطر، احتمالات بايز التراكمية، وتحليل M15 بدون استهلاك شبكة
 # ==============================================================================
 class AdvancedRiskAndSessionManager:
     def __init__(self):
@@ -585,6 +673,25 @@ class AdvancedRiskAndSessionManager:
         else:
             return {"SMC": 0.30, "VWAP": 0.40, "MOM": 0.30, "session": "Late NY"}
 
+    def get_bayesian_rolling_kelly(self) -> float:
+        df_trades = DuckDBWarehouse.get_recent_closed_trades(limit=30)
+        if len(df_trades) < 10:
+            return max(0.05, (0.58 * 2.5 - 0.42) / 2.5)
+
+        pnls = df_trades['pnl'].values
+        wins = pnls[pnls > 0]
+        losses = abs(pnls[pnls < 0])
+
+        total_count = len(pnls)
+        p_bayesian = (len(wins) + 6.0) / (total_count + 10.0)
+        
+        avg_win = np.mean(wins) if len(wins) > 0 else 1.0
+        avg_loss = np.mean(losses) if len(losses) > 0 else 1.0
+        b_ratio = max(1.2, avg_win / (avg_loss + 1e-8))
+
+        full_kelly = max(0.02, min(0.40, (p_bayesian * b_ratio - (1.0 - p_bayesian)) / b_ratio))
+        return full_kelly
+
     def calculate_lot_size(self, epic: str, equity: float, current_price: float, sl_pips: float) -> float:
         if current_price <= 0 or np.isnan(current_price):
             current_price = 1.0850
@@ -593,8 +700,8 @@ class AdvancedRiskAndSessionManager:
         if self.consecutive_losses >= 2:
             active_kelly *= 0.5
 
-        full_kelly = max(0.05, (0.58 * 2.5 - 0.42) / 2.5)
-        risk_capital = equity * (full_kelly * active_kelly)
+        bayesian_kelly = self.get_bayesian_rolling_kelly()
+        risk_capital = equity * (bayesian_kelly * active_kelly)
         
         pip_val_usd = FastCapitalBroker.get_pip_value_usd(epic, current_price)
         pip_risk = sl_pips * pip_val_usd
@@ -645,7 +752,7 @@ class MultiTimeframeAnalyzer:
             return 0, f"خطأ تجميع M15: {e}"
 
 # ==============================================================================
-# 9. المصادقة البصرية للشارت عبر Gemini Vision مع حماية الذاكرة
+# 9. المصادقة البصرية للشارت عبر Gemini Vision مع حماية الذاكرة الرامية
 # ==============================================================================
 class GeminiChartVisionValidator:
     @staticmethod
@@ -655,11 +762,11 @@ class GeminiChartVisionValidator:
             return ""
 
         v = vwap_series.tail(40).values
-        fig, ax = plt.subplots(figsize=(6, 3), dpi=100)
-        try:
-            fig.patch.set_facecolor('#0E1117')
-            ax.set_facecolor('#0E1117')
+        fig = Figure(figsize=(6, 3), dpi=100, facecolor='#0E1117')
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111, facecolor='#0E1117')
 
+        try:
             for i, row in d.iterrows():
                 color = '#00FF7F' if row['close'] >= row['open'] else '#FF3B30'
                 ax.plot([i, i], [row['low'], row['high']], color=color, linewidth=1)
@@ -667,18 +774,16 @@ class GeminiChartVisionValidator:
 
             ax.plot(range(len(v)), v, color='#00BFFF', linestyle='--', linewidth=1.5, label="VWAP")
             ax.axis('off')
-            plt.tight_layout()
+            fig.tight_layout()
 
             buf = io.BytesIO()
-            plt.savefig(buf, format='png', bbox_inches='tight', facecolor=fig.get_facecolor(), edgecolor='none')
+            canvas.print_png(buf)
             buf.seek(0)
             img_b64 = base64.b64encode(buf.read()).decode('utf-8')
             buf.close()
             return img_b64
         finally:
-            plt.clf()
-            plt.close('all')
-            del fig, ax
+            del fig, ax, canvas
             gc.collect()
 
     @classmethod
@@ -899,13 +1004,30 @@ class MasterQuantSystem:
             
             if deal_id and deal_id not in self.processed_deal_ids:
                 pnl_val = act.get("profitAndLoss") or act.get("pnl") or details.get("profitAndLoss") or details.get("profit")
+                epic = act.get("epic") or details.get("epic") or "EURUSD"
+                direction = act.get("direction") or details.get("direction") or "BUY"
+                
                 if pnl_val is not None:
                     pnl = float(pnl_val)
                     if pnl < 0:
                         self.risk_mgr.consecutive_losses += 1
                     else:
                         self.risk_mgr.consecutive_losses = 0
+                    
+                    DuckDBWarehouse.log_closed_trade(str(deal_id), str(epic), str(direction), pnl)
+
                 self.processed_deal_ids.add(deal_id)
+
+    def enforce_swap_closure_if_needed(self):
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.hour == 21 and 50 <= now_utc.minute <= 55:
+            open_pos = self.broker.get_open_positions()
+            for p in open_pos:
+                deal_id = p.get("position", {}).get("dealId")
+                upl = float(p.get("position", {}).get("upl", 0.0))
+                if deal_id and upl > 0:
+                    self.broker.close_position_immediately(deal_id)
+                    print(f"[Swap Guard]: تم إغلاق الصفقة {deal_id} بربح ${upl:.2f} لتفادي رسوم التبييت الليلية.")
 
     def run_single_asset_backtest(self, epic: str, df: pd.DataFrame) -> dict:
         if len(df) < 60:
@@ -932,13 +1054,11 @@ class MasterQuantSystem:
         pos[signals > 0.40] = 1
         pos[signals < -0.40] = -1
 
-        # محاكاة الصفقات المكتملة وحساب معدل الفوز الواقعي
         trades = []
         current_pos = 0
         entry_price = 0.0
 
         spread = 0.8 * pip_mult
-        cum_pnl = 0.0
         equity_curve = [1000.0]
 
         for i in range(len(d) - 1):
@@ -956,7 +1076,6 @@ class MasterQuantSystem:
                     raw_pips = (entry_price - exit_price - spread) / pip_mult
 
                 trades.append(raw_pips > 0)
-                cum_pnl += raw_pips
                 equity_curve.append(equity_curve[-1] * (1.0 + (raw_pips * 0.001)))
                 current_pos = p
                 entry_price = price
@@ -983,16 +1102,20 @@ class MasterQuantSystem:
         if not cb_ok:
             return {"action": "CIRCUIT_BREAKER", "reason": cb_msg}
 
-        # 2. فحص مواعيد السوق والأخبار
+        # 2. فحص مواعيد السوق، الأخبار، وحماية رسوم التبييت
         market_ok, market_msg = MarketShield.check_market_hours()
         if not market_ok:
             return {"action": "HALT", "reason": market_msg}
+
+        swap_ok, swap_msg = MarketShield.check_overnight_swap_window()
+        if not swap_ok:
+            return {"action": "SWAP_BLOCK", "reason": swap_msg}
 
         news_block, news_msg = MarketShield.check_live_news()
         if news_block:
             return {"action": "NEWS_BLOCK", "reason": news_msg}
 
-        # 3. الصفقات المفتوحة مسبقاً وسقف التزامن
+        # 3. فحص سقف الصفقات المتزامنة
         open_pos = self.broker.get_open_positions()
         if len(open_pos) >= Config.MAX_OPEN_POSITIONS:
             return {"action": "IN_POSITION", "reason": f"تم بلوغ الحد الأقصى للصفقات المتزامنة ({len(open_pos)})"}
@@ -1010,7 +1133,10 @@ class MasterQuantSystem:
             last = df_m1.iloc[-1]
             live_spread_pips = (last['ask_close'] - last['close']) / pip_mult
 
-            # حساب ATR(14)
+            rolling_spread = ((df_m1['ask_close'] - df_m1['close']).rolling(10).mean().iloc[-1]) / pip_mult
+            if live_spread_pips > (rolling_spread * Config.SPREAD_EXPANSION_VELOCITY_MAX):
+                continue
+
             tr = np.maximum(df_m1['high'] - df_m1['low'], 
                             np.maximum(abs(df_m1['high'] - df_m1['close'].shift(1)), 
                                        abs(df_m1['low'] - df_m1['close'].shift(1))))
@@ -1019,7 +1145,6 @@ class MasterQuantSystem:
                 continue
             atr_pips = atr_val / pip_mult
 
-            # فلتر نسبة السبريد للمدى اللحظي
             if ((live_spread_pips / atr_pips) * 100.0) > Config.MAX_FRICTION_RATIO_PCT:
                 continue
 
@@ -1028,7 +1153,6 @@ class MasterQuantSystem:
             if regime == 2:
                 continue
 
-            # تحليل فريم M15 ذاتياً عبر مستودع DuckDB بدون استدعاء شبكة
             mtf_bias, _ = MultiTimeframeAnalyzer.get_m15_bias_from_duckdb(epic)
 
             current_price = last['close']
@@ -1046,7 +1170,6 @@ class MasterQuantSystem:
             score = (smc_sig * session_info["SMC"]) + (vwap_sig * session_info["VWAP"]) + (mom_sig * session_info["MOM"])
 
             action = None
-            # تصحيح فلتر تفادي الانزلاق: منع الشراء إذا كان السعر ممتداً أعلى VWAP ومنع البيع إذا كان السعر ممتداً أسفل VWAP
             if score > 0.40 and mtf_bias > 0:
                 if current_price <= (vwap_val + 1.8 * atr_pips * pip_mult):
                     action = "BUY"
@@ -1055,7 +1178,6 @@ class MasterQuantSystem:
                     action = "SELL"
 
             if action:
-                # التحقق من إدارة ارتباط العملات ومخاطر الدولار المشترك
                 can_open, corr_msg = CurrencyCorrelationManager.can_open_position(open_pos, epic, action)
                 if not can_open:
                     continue
@@ -1105,7 +1227,11 @@ class MasterQuantSystem:
                     stop_pips=best_opp["sl_pips"],
                     profit_pips=best_opp["tp_pips"]
                 )
-                raw_ref = res.get("dealReference") or "OK"
+                
+                raw_ref = res.get("dealReference")
+                if not raw_ref:
+                    return {"action": "ORDER_FAILED", "reason": str(res.get("errorCode", "فشل استلام مرجع التنفيذ من الوسيط"))}
+
                 clean_ref = re.sub(r'[^a-zA-Z0-9-]', '', str(raw_ref))
 
                 return {
@@ -1149,14 +1275,15 @@ class MasterQuantSystem:
             df = DuckDBWarehouse.get_cached_candles(epic, limit=1000)
             if len(df) >= 60:
                 df_features = self.order_flow.calculate_volume_delta(df)
-                self.meta_labelers[epic].train_ensemble(df_features, self.broker.get_pip_multiplier(epic))
-                trained_epics.append(epic)
+                success, msg = self.meta_labelers[epic].train_ensemble_with_psi(df_features, self.broker.get_pip_multiplier(epic))
+                if success:
+                    trained_epics.append(epic)
                 bt_metrics = self.run_single_asset_backtest(epic, df)
                 backtest_results[epic] = bt_metrics
         
         entry = {
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "status": f"تم التدريب والباكتيست الذاتي لـ: {', '.join(trained_epics)}",
+            "status": f"تم فحص PSI والباكتيست الذاتي لـ: {', '.join(trained_epics) if trained_epics else 'تجميد الأوزان حفاظاً على الاستقرار'}",
             "results": backtest_results
         }
         self.evolution_log.append(entry)
@@ -1172,9 +1299,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👑 **نظام التداول الكمي المؤسسي الشامل متعدد العملات**\n\n"
         f"• محرك الذكاء الاصطناعي: **Google Gemini Flash (Vision + Tools)**\n"
         f"• أزواج العملات النشطة: **{', '.join(Config.ACTIVE_EPICS)}**\n"
-        f"• إدارة الارتباط: **Net USD Correlation Cap (حد أقصى {Config.MAX_OPEN_POSITIONS} صفقات)**\n"
+        f"• حماية رسوم التبييت: **Overnight Swap Guard مدمجة (21:30-22:15 UTC)**\n"
+        f"• سرعة السبريد: **Spread Expansion Velocity Filter نشط**\n"
+        f"• إدارة الارتباط: **Net USD Correlation Cap (سقف {Config.MAX_OPEN_POSITIONS} صفقات)**\n"
+        f"• صيغة كيلي التراكمية: **Bayesian Rolling Kelly من DuckDB**\n"
         f"• الوقف/الهدف: **ديناميكي وفق ATR (1.5x / 3.0x)**\n"
-        f"• مستودع البيانات: **DuckDB Candle Warehouse (M15 Resampling)**\n"
         f"• حساب التداول: **{'تجريبي (DEMO)' if system.broker.demo else 'حقيقي (LIVE)'}**\n"
         f"• حالة التداول الآلي: **{'نشط ✅' if system.autotrade_active else 'معطل ⏸'}**\n\n"
         "**الأوامر السريعة المتاحة:**\n"
@@ -1230,12 +1359,14 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     acc = system.broker.get_account_details()
     open_p = system.broker.get_open_positions()
     sess = system.risk_mgr.get_dynamic_session_weights()
+    current_kelly = system.risk_mgr.get_bayesian_rolling_kelly()
+    
     msg = (
         "💼 **[الحالة اللحظية والمحفظة]**\n\n"
         f"• الرصيد الإجمالي: `${acc['balance']:,.2f}`\n"
         f"• الرصيد المتاح: `${acc['available']:,.2f}`\n"
         f"• جلسة التداول: `{sess['session']}`\n"
-        f"• الأزواج تحت المراقبة: `{', '.join(Config.ACTIVE_EPICS)}`\n"
+        f"• معامل كيلي البايزي الفعلي: `{current_kelly:.3f}`\n"
         f"• إعدادات ATR الديناميكية: الوقف=`{Config.ATR_SL_MULTIPLIER}x` | الهدف=`{Config.ATR_TP_MULTIPLIER}x`\n"
         f"• قاطع الهبوط اليومي (3%): **{'حظر تداول 🚫' if system.risk_mgr.daily_circuit_breaker_active else 'طبيعي ومستقر ✅'}**\n"
         f"• الصفقات المفتوحة: `{len(open_p)} / {Config.MAX_OPEN_POSITIONS}`\n"
@@ -1263,7 +1394,7 @@ async def evolution_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last = system.evolution_log[-1]
     
     msg = (
-        "🧬 **[تقرير التدريب والباكتيست الذاتي الساعي]**\n\n"
+        "🧬 **[تقرير التدريب والباكتيست الذاتي الساعي مع فحص PSI]**\n\n"
         f"• التوقيت: `{last['timestamp']}`\n"
         f"• الحالة: {last['status']}\n\n"
         "**نتائج الباكتيست اللحظي للعملات:**\n"
@@ -1278,10 +1409,13 @@ async def evolution_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     blocked, news_msg = MarketShield.check_live_news()
     market_ok, market_msg = MarketShield.check_market_hours()
+    swap_ok, swap_msg = MarketShield.check_overnight_swap_window()
     msg = (
         "🌐 **[فحص السيولة والأخبار الحية لسلة العملات]**\n\n"
         f"• حالة الأخبار: **{'حظر تداول 🚫' if blocked else 'آمن للتداول ✅'}**\n"
         f"  ↳ {news_msg}\n\n"
+        f"• حماية رسوم التبييت: **{'حظر تبييت 🚫' if not swap_ok else 'آمن للتداول ✅'}**\n"
+        f"  ↳ {swap_msg}\n\n"
         f"• حالة جلسة السوق: **{'مفتوح ✅' if market_ok else 'مغلق ⏸'}**\n"
         f"  ↳ {market_msg}"
     )
@@ -1315,7 +1449,11 @@ async def gemini_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ==============================================================================
 async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
     try:
+        # تسوية الصفقات وفحص إغلاق التبييت
         await asyncio.to_thread(system.reconcile_closed_trades)
+        await asyncio.to_thread(system.enforce_swap_closure_if_needed)
+        
+        # مسح السوق وتدوير العملات
         res = await asyncio.to_thread(system.scan_and_rotate_assets)
 
         if res.get("action") in ["BUY", "SELL"]:
@@ -1354,7 +1492,7 @@ async def job_evolution_hourly(context: ContextTypes.DEFAULT_TYPE):
         results = evo.get("results", {})
         
         msg = (
-            "🧬 **[تقرير دوري آلي: التدريب والباكتيست الذاتي الساعي]**\n\n"
+            "🧬 **[تقرير دوري آلي: التدريب والباكتيست الذاتي الساعي مع فحص PSI]**\n\n"
             f"• التوقيت: `{evo['timestamp']}`\n"
             f"• الحالة: {evo['status']}\n\n"
             "**أداء سلة العملات في الباكتيست الأخير:**\n"
@@ -1385,7 +1523,7 @@ async def job_health_heartbeat(context: ContextTypes.DEFAULT_TYPE):
         print(f"[Heartbeat Error]: {e}")
 
 # ==============================================================================
-# نقطة التشغيل الرئيسية
+# نقطة التشغيل الرئيسية المتوافقة مع Windows و NSSM
 # ==============================================================================
 if __name__ == "__main__":
     print("[+] تشغيل نظام التداول المؤسسي المتقدم لـ Windows (Multi-Asset + Dynamic ATR + DuckDB)...")
