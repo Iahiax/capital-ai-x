@@ -65,8 +65,13 @@ class Config:
     LEVERAGE = 100.0
     KELLY_FRACTION = 0.25
     MAX_MARGIN_USAGE_PCT = 0.80
-    DEFAULT_STOP_PIPS = 4.0
-    DEFAULT_PROFIT_PIPS = 10.0
+    
+    # المعاملات الديناميكية المستندة لـ ATR
+    MIN_STOP_PIPS = 3.5
+    MIN_PROFIT_PIPS = 6.0
+    ATR_SL_MULTIPLIER = 1.5
+    ATR_TP_MULTIPLIER = 3.0
+    
     MAX_DAILY_DRAWDOWN_PCT = 3.0   # قاطع الهبوط اليومي (3%)
     MAX_FRICTION_RATIO_PCT = 20.0  # أقصى نسبة سبريد إلى مدى الشمعة اللحظي
 
@@ -197,11 +202,6 @@ class FastCapitalBroker:
 
     @classmethod
     def get_pip_value_usd(cls, epic: str, current_price: float) -> float:
-        """
-        حساب قيمة النقطة الواحدة للوت القياسي (100,000 وحدة) بالدولار الأمريكي بدقة:
-        - أزواج العملات المباشرة (EURUSD, GBPUSD, AUDUSD): 1 pip = $10.
-        - أزواج الين (USDJPY): 1 pip = (100,000 * 0.01) / current_price = 1000 / price.
-        """
         if "JPY" in epic.upper():
             return 1000.0 / (current_price if current_price > 0 else 150.0)
         return 10.0
@@ -338,7 +338,41 @@ class FastCapitalBroker:
         return []
 
 # ==============================================================================
-# 5. صمام أمان السوق والأخبار اللحظية متعدد العملات
+# 5. إدارة ارتباط العملات ومخاطر السلة المشتركة (Currency Correlation Manager)
+# ==============================================================================
+class CurrencyCorrelationManager:
+    """
+    حساب صافي التعرض اللحظي لعملة الدولار (USD Delta Exposure).
+    يمنع الدخول في صفقة جديدة تضاعف المخاطرة في نفس الاتجاه ضد الدولار.
+    """
+    @staticmethod
+    def get_usd_direction(epic: str, action: str) -> str:
+        # أزواج تنتهي بالدولار: BUY تعني بيع الدولار (-USD)، SELL تعني شراء الدولار (+USD)
+        if epic.upper().endswith("USD"):
+            return "SHORT_USD" if action == "BUY" else "LONG_USD"
+        # أزواج تبدأ بالدولار: BUY تعني شراء الدولار (+USD)، SELL تعني بيع الدولار (-USD)
+        elif epic.upper().startswith("USD"):
+            return "LONG_USD" if action == "BUY" else "SHORT_USD"
+        return "NEUTRAL"
+
+    @classmethod
+    def can_open_position(cls, open_positions: list, proposed_epic: str, proposed_action: str) -> tuple[bool, str]:
+        proposed_usd_dir = cls.get_usd_direction(proposed_epic, proposed_action)
+        if proposed_usd_dir == "NEUTRAL":
+            return True, "الزوج محايد تجاه الدولار"
+
+        for pos in open_positions:
+            pos_epic = pos.get("market", {}).get("epic") or pos.get("epic", "")
+            pos_dir = pos.get("position", {}).get("direction") or pos.get("direction", "")
+            
+            existing_usd_dir = cls.get_usd_direction(pos_epic, pos_dir)
+            if existing_usd_dir == proposed_usd_dir:
+                return False, f"حظر ارتباط: هناك مركز مفتوح مسبقاً على {pos_epic} يحمل نفس انكشاف الدولار ({proposed_usd_dir})."
+
+        return True, "انكشاف العملة متوازن"
+
+# ==============================================================================
+# 6. صمام أمان السوق والأخبار اللحظية متعدد العملات
 # ==============================================================================
 class MarketShield:
     RELEVANT_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "AUD"]
@@ -401,7 +435,7 @@ class MarketShield:
         return False, "لا توجد أخبار عالية التأثير في النافذة اللحظية."
 
 # ==============================================================================
-# 6. محرك تدفق الأوامر ودلتا الحجم ونماذج التعلم الآلي
+# 7. محرك تدفق الأوامر ودلتا الحجم ونماذج التعلم الآلي
 # ==============================================================================
 class OrderFlowEngine:
     @staticmethod
@@ -514,7 +548,7 @@ class HybridMetaLabeler:
         return float(np.mean(probs)) if probs else 0.70
 
 # ==============================================================================
-# 7. إدارة المخاطر، الجلسات، وتحديد حجم العقود الدقيق
+# 8. إدارة المخاطر، الجلسات، وتحليل M15 بدون استهلاك شبكة
 # ==============================================================================
 class AdvancedRiskAndSessionManager:
     def __init__(self):
@@ -554,7 +588,7 @@ class AdvancedRiskAndSessionManager:
         else:
             return {"SMC": 0.30, "VWAP": 0.40, "MOM": 0.30, "session": "Late NY"}
 
-    def calculate_lot_size(self, epic: str, equity: float, current_price: float) -> float:
+    def calculate_lot_size(self, epic: str, equity: float, current_price: float, sl_pips: float) -> float:
         if current_price <= 0 or np.isnan(current_price):
             current_price = 1.0850
 
@@ -565,9 +599,8 @@ class AdvancedRiskAndSessionManager:
         full_kelly = max(0.05, (0.58 * 2.5 - 0.42) / 2.5)
         risk_capital = equity * (full_kelly * active_kelly)
         
-        # استخدام القيمة النقطية الديناميكية بالدولار لحجم العقد
         pip_val_usd = FastCapitalBroker.get_pip_value_usd(epic, current_price)
-        pip_risk = Config.DEFAULT_STOP_PIPS * pip_val_usd
+        pip_risk = sl_pips * pip_val_usd
         calculated_lots = risk_capital / (pip_risk if pip_risk > 0 else 40.0)
         
         buying_power = equity * Config.LEVERAGE * Config.MAX_MARGIN_USAGE_PCT
@@ -581,20 +614,44 @@ class AdvancedRiskAndSessionManager:
 
 class MultiTimeframeAnalyzer:
     @staticmethod
-    def get_m15_bias(broker: FastCapitalBroker, epic: str) -> tuple[int, str]:
-        df_m15 = broker.fetch_live_candles(epic, resolution="MINUTE_15", max_bars=60)
-        if len(df_m15) < 30:
-            return 0, "بيانات M15 غير كافية"
-        ema20 = df_m15['close'].ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50 = df_m15['close'].ewm(span=50, adjust=False).mean().iloc[-1]
-        if ema20 > ema50:
-            return 1, "الاتجاه صاعد على M15"
-        elif ema20 < ema50:
-            return -1, "الاتجاه هابط على M15"
-        return 0, "اتجاه M15 محايد"
+    def get_m15_bias_from_duckdb(epic: str) -> tuple[int, str]:
+        """
+        توليد فريم M15 ذاتياً من مستودع DuckDB المحلي بدون استدعاء شبكة (Zero-Latency)
+        """
+        df_m1 = DuckDBWarehouse.get_cached_candles(epic, limit=1000)
+        if len(df_m1) < 150:
+            return 0, "بيانات DuckDB غير كافية لـ M15"
+
+        try:
+            d = df_m1.copy()
+            d['dt'] = pd.to_datetime(d['timestamp'])
+            d.set_index('dt', inplace=True)
+            
+            # إعادة تجميع الشموع اللحظية إلى فريم 15 دقيقة
+            df_m15 = d.resample('15min').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna().reset_index()
+
+            if len(df_m15) < 30:
+                return 0, "شمعات M15 المجمعة غير كافية"
+
+            ema20 = df_m15['close'].ewm(span=20, adjust=False).mean().iloc[-1]
+            ema50 = df_m15['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+
+            if ema20 > ema50:
+                return 1, "الاتجاه صاعد على M15 (DuckDB)"
+            elif ema20 < ema50:
+                return -1, "الاتجاه هابط على M15 (DuckDB)"
+            return 0, "اتجاه M15 محايد"
+        except Exception as e:
+            return 0, f"خطأ تجميع M15: {e}"
 
 # ==============================================================================
-# 8. المصادقة البصرية للشارت عبر Gemini Vision مع حماية الذاكرة
+# 9. المصادقة البصرية للشارت عبر Gemini Vision مع حماية الذاكرة
 # ==============================================================================
 class GeminiChartVisionValidator:
     @staticmethod
@@ -620,6 +677,7 @@ class GeminiChartVisionValidator:
             plt.savefig(buf, format='png', bbox_inches='tight', facecolor=fig.get_facecolor(), edgecolor='none')
             buf.seek(0)
             img_b64 = base64.b64encode(buf.read()).decode('utf-8')
+            buf.close()
             return img_b64
         finally:
             plt.clf()
@@ -668,26 +726,26 @@ class GeminiChartVisionValidator:
         return True, "تم تخطي الفحص البصري"
 
 # ==============================================================================
-# 9. محرك Google Gemini مع Function Calling المحدث
+# 10. محرك Google Gemini مع Function Calling المحدث
 # ==============================================================================
 GEMINI_FUNCTION_TOOLS = [
     {
         "functionDeclarations": [
             {
                 "name": "update_trading_risk",
-                "description": "تعديل إعدادات المخاطر مثل مسافة وقف الخسارة وجني الأرباح ونسبة صيغة كيلي",
+                "description": "تعديل إعدادات مضاعفات الوقف والهدف المشتقة من ATR ونسبة صيغة كيلي",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
-                        "stop_pips": {"type": "NUMBER", "description": "مسافة وقف الخسارة بالنقاط (Pips)"},
-                        "profit_pips": {"type": "NUMBER", "description": "مسافة جني الأرباح بالنقاط (Pips)"},
+                        "atr_sl_mult": {"type": "NUMBER", "description": "مضاعف الوقف بالنسبة لـ ATR (مثلاً 1.5)"},
+                        "atr_tp_mult": {"type": "NUMBER", "description": "مضاعف الهدف بالنسبة لـ ATR (مثلاً 3.0)"},
                         "kelly_fraction": {"type": "NUMBER", "description": "نسبة كسر كيلي (بين 0.05 و 0.50)"}
                     }
                 }
             },
             {
                 "name": "force_recalibrate_models",
-                "description": "إعادة تدريب نماذج التعلم الآلي CatBoost/LightGBM وتحديث أوزان الاستراتيجيات فورياً لجميع الأزواج",
+                "description": "إعادة تدريب نماذج التعلم الآلي CatBoost/LightGBM والباكتيست الذاتي لجميع الأزواج فورياً",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {}
@@ -739,6 +797,7 @@ class GeminiConversationalAgent:
 - الصفقات المفتوحة: {system_context.get('open_trades', 0)}
 - التداول الآلي: {'نشط' if system_context.get('autotrade') else 'متوقف مؤقتاً'}
 - وضع الحساب: {'تجريبي (DEMO)' if system_context.get('is_demo') else 'حقيقي (LIVE)'}
+- مضاعفات ATR الحالية: الوقف={Config.ATR_SL_MULTIPLIER}x | الهدف={Config.ATR_TP_MULTIPLIER}x
 
 المهمة:
 1. إذا طلب المتداول تعديل أي إعداد، استدعِ الأداة المناسبة فوراً (Function Calling).
@@ -775,16 +834,16 @@ class GeminiConversationalAgent:
                 args = func_call.get("args", {})
 
                 if func_name == "update_trading_risk":
-                    if "stop_pips" in args:
-                        Config.DEFAULT_STOP_PIPS = float(args["stop_pips"])
-                    if "profit_pips" in args:
-                        Config.DEFAULT_PROFIT_PIPS = float(args["profit_pips"])
+                    if "atr_sl_mult" in args:
+                        Config.ATR_SL_MULTIPLIER = float(args["atr_sl_mult"])
+                    if "atr_tp_mult" in args:
+                        Config.ATR_TP_MULTIPLIER = float(args["atr_tp_mult"])
                     if "kelly_fraction" in args:
                         Config.KELLY_FRACTION = float(args["kelly_fraction"])
                     return (
                         f"✅ **[تم تطبيق التعديل ذاتياً بواسطة Gemini]**\n\n"
-                        f"• وقف الخسارة الجديد: `{Config.DEFAULT_STOP_PIPS}` نقطة\n"
-                        f"• جني الأرباح الجديد: `{Config.DEFAULT_PROFIT_PIPS}` نقطة\n"
+                        f"• مضاعف وقف ATR: `{Config.ATR_SL_MULTIPLIER}x`\n"
+                        f"• مضاعف هدف ATR: `{Config.ATR_TP_MULTIPLIER}x`\n"
                         f"• نسبة كسر كيلي للمخاطرة: `{Config.KELLY_FRACTION}`"
                     )
 
@@ -819,7 +878,7 @@ class GeminiConversationalAgent:
             return f"تعذر استكمال المعالجة عبر Gemini: {e}"
 
 # ==============================================================================
-# 10. محرك النظام الرئيسي وتدوير العملات والباكتيست الموحد
+# 11. محرك النظام الرئيسي وتدوير العملات والباكتيست الموحد
 # ==============================================================================
 class MasterQuantSystem:
     def __init__(self):
@@ -850,9 +909,6 @@ class MasterQuantSystem:
                 self.processed_deal_ids.add(deal_id)
 
     def run_single_asset_backtest(self, epic: str, df: pd.DataFrame) -> dict:
-        """
-        محرك باكتيست موحد ومتقن للزوج الواحد يأخذ بالاعتبار السبريد الحقيقي والقيمة النقطية
-        """
         if len(df) < 150:
             return {"status": "بيانات غير كافية"}
 
@@ -900,10 +956,12 @@ class MasterQuantSystem:
     def scan_and_rotate_assets(self) -> dict:
         acc = self.broker.get_account_details()
 
+        # 1. فحص قاطع الهبوط اليومي
         cb_ok, cb_msg = self.risk_mgr.check_circuit_breakers(acc["balance"])
         if not cb_ok:
             return {"action": "CIRCUIT_BREAKER", "reason": cb_msg}
 
+        # 2. فحص مواعيد السوق والأخبار
         market_ok, market_msg = MarketShield.check_market_hours()
         if not market_ok:
             return {"action": "HALT", "reason": market_msg}
@@ -912,6 +970,7 @@ class MasterQuantSystem:
         if news_block:
             return {"action": "NEWS_BLOCK", "reason": news_msg}
 
+        # 3. الصفقات المفتوحة مسبقاً
         open_pos = self.broker.get_open_positions()
         if len(open_pos) > 0:
             return {"action": "IN_POSITION", "reason": "هناك صفقة قائمة تحت حماية الوقف المتحرك"}
@@ -919,6 +978,7 @@ class MasterQuantSystem:
         session_info = self.risk_mgr.get_dynamic_session_weights()
         qualified_opportunities = []
 
+        # 4. مسح سلة العملات بالكامل
         for epic in Config.ACTIVE_EPICS:
             pip_mult = self.broker.get_pip_multiplier(epic)
             df_m1 = self.broker.fetch_live_candles(epic, resolution="MINUTE", max_bars=100)
@@ -928,6 +988,7 @@ class MasterQuantSystem:
             last = df_m1.iloc[-1]
             live_spread_pips = (last['ask_close'] - last['close']) / pip_mult
 
+            # حساب ATR(14)
             tr = np.maximum(df_m1['high'] - df_m1['low'], 
                             np.maximum(abs(df_m1['high'] - df_m1['close'].shift(1)), 
                                        abs(df_m1['low'] - df_m1['close'].shift(1))))
@@ -936,6 +997,7 @@ class MasterQuantSystem:
                 continue
             atr_pips = atr_val / pip_mult
 
+            # فلتر نسبة السبريد للمدى اللحظي
             if ((live_spread_pips / atr_pips) * 100.0) > Config.MAX_FRICTION_RATIO_PCT:
                 continue
 
@@ -944,14 +1006,21 @@ class MasterQuantSystem:
             if regime == 2:
                 continue
 
-            mtf_bias, _ = MultiTimeframeAnalyzer.get_m15_bias(self.broker, epic)
+            # تحليل فريم M15 ذاتياً عبر مستودع DuckDB بدون استدعاء شبكة
+            mtf_bias, _ = MultiTimeframeAnalyzer.get_m15_bias_from_duckdb(epic)
 
             current_price = last['close']
             tp = (df_m1['high'] + df_m1['low'] + df_m1['close']) / 3
             vwap = (tp * df_m1['volume']).cumsum() / (df_m1['volume'].cumsum() + 1e-8)
             std = (tp - vwap).rolling(30).std()
-            vwap_lower = vwap.iloc[-1] - (2.0 * std.iloc[-1])
-            vwap_upper = vwap.iloc[-1] + (2.0 * std.iloc[-1])
+            vwap_val = vwap.iloc[-1]
+            vwap_lower = vwap_val - (2.0 * std.iloc[-1])
+            vwap_upper = vwap_val + (2.0 * std.iloc[-1])
+
+            # فلتر الارتداد العادل وتفادي الانزلاق: منع الدخول إذا كان السعر متباعداً بشدة عن VWAP
+            distance_to_vwap_pips = abs(current_price - vwap_val) / pip_mult
+            if distance_to_vwap_pips > (1.8 * atr_pips):
+                continue
 
             smc_sig = 1 if last['bullish_absorption'] else (-1 if last['bearish_absorption'] else 0)
             vwap_sig = 1 if current_price < vwap_lower else (-1 if current_price > vwap_upper else 0)
@@ -966,17 +1035,28 @@ class MasterQuantSystem:
                 action = "SELL"
 
             if action:
+                # التحقق من إدارة ارتباط العملات ومخاطر الدولار المشترك
+                can_open, corr_msg = CurrencyCorrelationManager.can_open_position(open_pos, epic, action)
+                if not can_open:
+                    continue
+
                 mom_val = df_m1['close'].pct_change(10).iloc[-1]
                 meta_features = np.array([current_price, last['volume'], mom_val, last['cvd_zscore']])
                 prob_success = self.meta_labelers[epic].predict_success_probability(meta_features)
 
                 if prob_success >= 0.65:
+                    # احتساب الوقف والهدف الديناميكي القائم على ATR
+                    dyn_sl = max(Config.MIN_STOP_PIPS, round(atr_pips * Config.ATR_SL_MULTIPLIER, 1))
+                    dyn_tp = max(Config.MIN_PROFIT_PIPS, round(atr_pips * Config.ATR_TP_MULTIPLIER, 1))
+
                     qualified_opportunities.append({
                         "epic": epic,
                         "action": action,
                         "score": abs(score),
                         "prob": prob_success,
                         "price": current_price,
+                        "sl_pips": dyn_sl,
+                        "tp_pips": dyn_tp,
                         "df": df_m1,
                         "vwap": vwap
                     })
@@ -992,14 +1072,19 @@ class MasterQuantSystem:
                 return {"action": "VISION_REJECTED", "reason": f"رفض بصري لزوج {best_opp['epic']}: {vision_reason}"}
 
             if self.autotrade_active:
-                lots = self.risk_mgr.calculate_lot_size(best_opp["epic"], acc["available"], best_opp["price"])
+                lots = self.risk_mgr.calculate_lot_size(
+                    best_opp["epic"], 
+                    acc["available"], 
+                    best_opp["price"],
+                    best_opp["sl_pips"]
+                )
                 res = self.broker.execute_order_server_trailing(
                     epic=best_opp["epic"],
                     direction=best_opp["action"],
                     size=lots,
                     current_price=best_opp["price"],
-                    stop_pips=Config.DEFAULT_STOP_PIPS,
-                    profit_pips=Config.DEFAULT_PROFIT_PIPS
+                    stop_pips=best_opp["sl_pips"],
+                    profit_pips=best_opp["tp_pips"]
                 )
                 raw_ref = res.get("dealReference") or "OK"
                 clean_ref = re.sub(r'[^a-zA-Z0-9-]', '', str(raw_ref))
@@ -1009,18 +1094,22 @@ class MasterQuantSystem:
                     "epic": best_opp["epic"],
                     "price": best_opp["price"],
                     "lots": lots,
+                    "sl_pips": best_opp["sl_pips"],
+                    "tp_pips": best_opp["tp_pips"],
                     "prob": round(best_opp["prob"], 2),
                     "session": session_info["session"],
                     "deal_ref": clean_ref,
-                    "reason": f"اقتناص أقوى فرصة بين العملات ({best_opp['epic']}) - مصادقة بصرية"
+                    "reason": f"اقتناص فرصة رابحة ({best_opp['epic']}) بوقف ديناميكي {best_opp['sl_pips']} نقطة"
                 }
             else:
                 return {
                     "action": "SIGNAL_DETECTED",
                     "epic": best_opp["epic"],
                     "price": best_opp["price"],
+                    "sl_pips": best_opp["sl_pips"],
+                    "tp_pips": best_opp["tp_pips"],
                     "prob": round(best_opp["prob"], 2),
-                    "reason": f"تم رصد فرصة ممتازة على {best_opp['epic']} ولكن التداول الآلي معطل (المراقبة فقط)"
+                    "reason": f"فرصة ممتازة على {best_opp['epic']} ولكن التداول الآلي معطل (المراقبة فقط)"
                 }
 
         return {"action": "HOLD", "reason": "استقرار محايد عبر كافة العملات النشطة"}
@@ -1034,21 +1123,15 @@ class MasterQuantSystem:
         return results
 
     def train_and_evolve(self) -> dict:
-        """
-        دورة الباكتيست والتدريب الذاتي الشاملة لكل زوج عملة كل ساعة
-        """
         trained_epics = []
         backtest_results = {}
         
         for epic in Config.ACTIVE_EPICS:
             df = DuckDBWarehouse.get_cached_candles(epic, limit=1000)
             if len(df) >= 150:
-                # 1. تدريب نماذج التعلم الآلي للزوج
                 df_features = self.order_flow.calculate_volume_delta(df)
                 self.meta_labelers[epic].train_ensemble(df_features, self.broker.get_pip_multiplier(epic))
                 trained_epics.append(epic)
-                
-                # 2. تشغيل باكتيست فوري دقيق ومستقل للزوج
                 bt_metrics = self.run_single_asset_backtest(epic, df)
                 backtest_results[epic] = bt_metrics
         
@@ -1061,7 +1144,7 @@ class MasterQuantSystem:
         return entry
 
 # ==============================================================================
-# 11. أوامر التيليجرام التفاعلية المباشرة
+# 12. أوامر التيليجرام التفاعلية المباشرة (أوامر صريحة بدون أزرار تفاعلية)
 # ==============================================================================
 system = MasterQuantSystem()
 
@@ -1070,7 +1153,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👑 **نظام التداول الكمي المؤسسي الشامل متعدد العملات**\n\n"
         f"• محرك الذكاء الاصطناعي: **Google Gemini Flash (Vision + Tools)**\n"
         f"• أزواج العملات النشطة: **{', '.join(Config.ACTIVE_EPICS)}**\n"
-        f"• مستودع البيانات المحلي: **DuckDB Candle Warehouse متصل**\n"
+        f"• إدارة الارتباط: **Net USD Correlation Cap مدمجة**\n"
+        f"• الوقف/الهدف: **ديناميكي وفق ATR (1.5x / 3.0x)**\n"
+        f"• مستودع البيانات: **DuckDB Candle Warehouse (M15 Resampling)**\n"
         f"• حساب التداول: **{'تجريبي (DEMO)' if system.broker.demo else 'حقيقي (LIVE)'}**\n"
         f"• حالة التداول الآلي: **{'نشط ✅' if system.autotrade_active else 'معطل ⏸'}**\n\n"
         "**الأوامر السريعة المتاحة:**\n"
@@ -1083,7 +1168,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/health` - مراقبة صحة الخادم، الرام والمعالج (Watchdog)\n"
         "• `/evolution` - تقرير تدريب وباكتيست نماذج التعلم الآلي\n"
         "• `/news` - فحص مفكرة الأخبار الاقتصادية اللحظية\n\n"
-        "💬 *يمكنك محادثة Gemini بالعربية أو توجيه أوامر مثل: 'اجعل وقف الخسارة 5 نقاط' أو 'أعد تدريب النماذج'!*"
+        "💬 *يمكنك محادثة Gemini بالعربية أو توجيه أوامر مثل: 'عدل مضاعف وقف ATR إلى 2' أو 'أعد تدريب النماذج'!*"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -1133,6 +1218,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• الرصيد المتاح: `${acc['available']:,.2f}`\n"
         f"• جلسة التداول: `{sess['session']}`\n"
         f"• الأزواج تحت المراقبة: `{', '.join(Config.ACTIVE_EPICS)}`\n"
+        f"• إعدادات ATR الديناميكية: الوقف=`{Config.ATR_SL_MULTIPLIER}x` | الهدف=`{Config.ATR_TP_MULTIPLIER}x`\n"
         f"• قاطع الهبوط اليومي (3%): **{'حظر تداول 🚫' if system.risk_mgr.daily_circuit_breaker_active else 'طبيعي ومستقر ✅'}**\n"
         f"• الصفقات المفتوحة: `{len(open_p)}`\n"
         f"• التداول الآلي: **{'نشط ✅' if system.autotrade_active else 'معطل ⏸'}**"
@@ -1207,7 +1293,7 @@ async def gemini_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 # ==============================================================================
-# 12. مهام الجدولة اللحظية والساعية ونبضات الصحة
+# 13. مهام الجدولة اللحظية والساعية ونبضات الصحة
 # ==============================================================================
 async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1221,6 +1307,8 @@ async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
                 f"• الاتجاه: `{res['action']}`\n"
                 f"• السعر: `{res['price']}`\n"
                 f"• حجم العقد: `{res['lots']} Lot`\n"
+                f"• وقف الخسارة الديناميكي: `{res.get('sl_pips')} Pips`\n"
+                f"• جني الأرباح الديناميكي: `{res.get('tp_pips')} Pips`\n"
                 f"• الجلسة: `{res.get('session', 'N/A')}`\n"
                 f"• احتمالية النجاح: `{res['prob']*100:.1f}%`\n"
                 f"• المصادقة البصرية: **معتمدة عبر Gemini Vision**\n"
@@ -1232,6 +1320,7 @@ async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
                 f"📡 **[رصد إشارة دخول - وضع المراقبة]**\n\n"
                 f"• الزوج: `{res['epic']}`\n"
                 f"• السعر: `{res['price']}`\n"
+                f"• الوقف/الهدف المقترح: `{res.get('sl_pips')} / {res.get('tp_pips')} Pips`\n"
                 f"• الاحتمالية: `{res['prob']*100:.1f}%`\n"
                 f"• الحالة: {res['reason']}"
             )
@@ -1242,9 +1331,6 @@ async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
         print(f"[Scanner Job Error]: {e}")
 
 async def job_evolution_hourly(context: ContextTypes.DEFAULT_TYPE):
-    """
-    مهمة الباكتيست والتدريب الذاتي كل ساعة مع إرسال تقرير إحصائي كامل إلى تيليجرام
-    """
     try:
         evo = await asyncio.to_thread(system.train_and_evolve)
         results = evo.get("results", {})
@@ -1284,10 +1370,10 @@ async def job_health_heartbeat(context: ContextTypes.DEFAULT_TYPE):
 # نقطة التشغيل الرئيسية
 # ==============================================================================
 if __name__ == "__main__":
-    print("[+] تشغيل نظام التداول المؤسسي المتقدم لـ Windows (Multi-Asset + DuckDB)...")
+    print("[+] تشغيل نظام التداول المؤسسي المتقدم لـ Windows (Multi-Asset + Dynamic ATR + DuckDB)...")
     app = ApplicationBuilder().token(Config.TELEGRAM_BOT_TOKEN).build()
 
-    # تسجيل الأوامر
+    # تسجيل الأوامر الصريحة بدون أزرار تفاعلية
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("autotrade_on", autotrade_on_cmd))
     app.add_handler(CommandHandler("autotrade_off", autotrade_off_cmd))
