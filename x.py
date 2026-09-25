@@ -36,6 +36,7 @@ import psutil
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import Conflict, NetworkError
 
 # التحقق من توفر مكتبات التعلم الآلي
 try:
@@ -154,7 +155,7 @@ class Config:
     DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market_warehouse.duckdb")
 
 # ==============================================================================
-# 2. هندسة استقرار ويندوز ومعالج الانهيارات (Core Affinity & Crash Dump)
+# 2. هندسة استقرار ويندوز ومعالج الانهيارات
 # ==============================================================================
 def tune_windows_process_affinity_and_priority():
     try:
@@ -194,7 +195,7 @@ def setup_crash_dump_handler():
     sys.excepthook = global_excepthook
 
 # ==============================================================================
-# 3. مستودع البيانات المحلي فائق السرعة عبر DuckDB (قفل متبادل آمن على ويندوز)
+# 3. مستودع البيانات المحلي فائق السرعة عبر DuckDB
 # ==============================================================================
 class DuckDBWarehouse:
     _lock = threading.RLock()
@@ -346,7 +347,6 @@ class DuckDBWarehouse:
         with cls._lock:
             con = duckdb.connect(Config.DB_FILE)
             try:
-                # معالجة تنسيق T في مقارنة السلاسل الزمنية بدقة في DuckDB
                 query = f"""
                     SELECT MAX(high) as asian_high, MIN(low) as asian_low
                     FROM m1_candles
@@ -377,7 +377,7 @@ class DuckDBWarehouse:
                 con.close()
 
 # ==============================================================================
-# 4. النماذج الرياضية والإحصائية المتقدمة (Advanced Mathematical Models)
+# 4. النماذج الرياضية والإحصائية المتقدمة
 # ==============================================================================
 class AdvancedQuantMath:
     @staticmethod
@@ -481,7 +481,6 @@ class AdvancedQuantMath:
 
     @staticmethod
     def predict_garch_volatility(returns: np.ndarray) -> float:
-        """التنبؤ بالتقلب المسبق مع تطبيق استهداف التباين Variance Targeting"""
         if len(returns) < 20:
             return float(np.std(returns) if len(returns) > 0 else 0.0005)
         alpha = 0.10
@@ -522,7 +521,7 @@ class AdvancedQuantMath:
         return pd.Series(labels, index=df.index)
 
 # ==============================================================================
-# 5. مؤقت اليقظة وقفل الأوامر المتزامن (Watchdog & Mutex Order Lock)
+# 5. مؤقت اليقظة وقفل الأوامر المتزامن
 # ==============================================================================
 class OrderExecutionMutex:
     _lock = threading.Lock()
@@ -584,7 +583,7 @@ class InternalSystemWatchdog:
         }
 
 # ==============================================================================
-# 6. وسيط Capital.com مع التجديد المسبق للتوكن وقياس زمن الاستجابة
+# 6. وسيط Capital.com مع التجديد المسبق للتوكن
 # ==============================================================================
 class FastCapitalBroker:
     def __init__(self):
@@ -846,7 +845,7 @@ class FastCapitalBroker:
         return []
 
 # ==============================================================================
-# 7. بنية السوق الدقيقة والتنفيذ (Market Microstructure & Spreads)
+# 7. بنية السوق الدقيقة والتنفيذ
 # ==============================================================================
 class MarketMicrostructureEngine:
     @staticmethod
@@ -942,7 +941,6 @@ class SyntheticDXYEngine:
             a = DuckDBWarehouse.get_cached_candles("AUDUSD", limit=30)
 
             if min(len(e), len(j), len(g), len(a)) >= 15:
-                # المحاذاة الزمنية المتزامنة للمؤشر التجميعي بدقة الدقيقة
                 e['t'] = e['timestamp'].astype(str).str.replace('T', ' ').str.slice(0, 16)
                 j['t'] = j['timestamp'].astype(str).str.replace('T', ' ').str.slice(0, 16)
                 g['t'] = g['timestamp'].astype(str).str.replace('T', ' ').str.slice(0, 16)
@@ -1330,7 +1328,7 @@ class PopulationStabilityIndex:
             return 0.0
 
 # ==============================================================================
-# 11. النماذج الهجينة والمصادقة الإحصائية (Conformal & Online Pruning & Canary)
+# 11. النماذج الهجينة والمصادقة الإحصائية
 # ==============================================================================
 class HybridMetaLabeler:
     FEATURE_NAMES = ["close", "vol", "mom", "cvd", "frac_diff", "kalman_v"]
@@ -1498,7 +1496,7 @@ class CanaryShadowTester:
         return True
 
 # ==============================================================================
-# 12. إدارة المخاطر، التهدئة، تدرج التراجع، وتكافؤ المخاطر (Risk Parity & CVaR)
+# 12. إدارة المخاطر، التهدئة، تدرج التراجع، وتكافؤ المخاطر
 # ==============================================================================
 class AdvancedRiskAndSessionManager:
     def __init__(self):
@@ -2079,7 +2077,7 @@ class MasterQuantSystem:
                 epic = act.get("epic") or details.get("epic") or "EURUSD"
                 direction = act.get("direction") or details.get("direction") or "BUY"
                 
-                # إضافة المعرف فقط عند التأكد من إغلاق الصفقة ووجود قيمة PnL (Fix 2)
+                # إضافة المعرف فقط عند التأكد من إغلاق الصفقة ووجود قيمة PnL
                 if pnl_val is not None:
                     pnl = float(pnl_val)
                     if pnl < 0:
@@ -2099,7 +2097,6 @@ class MasterQuantSystem:
                     ref_price = 150.0 if "JPY" in str(epic).upper() else 1.0850
                     pip_val = FastCapitalBroker.get_pip_value_usd(str(epic), ref_price)
                     
-                    # استخراج حجم العقد بدقة لحساب التكلفة الحقيقية للصفقة (Fix 3)
                     pos_size = float(act.get("size") or details.get("size") or 0.02)
                     spread_cost = round(0.8 * pip_val * pos_size, 2)
                     friction_usd = round((0.8 + slip) * pip_val * pos_size, 2)
@@ -2137,7 +2134,6 @@ class MasterQuantSystem:
             current_bid = float(p.get("market", {}).get("bid") or 0.0)
             current_offer = float(p.get("market", {}).get("offer") or 0.0)
             
-            # جلب الأسعار اللحظية كبديل فوري إذا كانت القيم غير متوفرة في لقطة المركز
             if current_bid <= 0 or current_offer <= 0:
                 current_bid, current_offer = self.broker.get_latest_quote(epic)
 
@@ -2160,7 +2156,7 @@ class MasterQuantSystem:
             elif direction == "SELL" and current_offer > 0:
                 profit_pips = (entry_price - current_offer) / pip_mult
 
-            # الخروج الزمني وفق عمر النصف لنموذج أورنشتاين-أولينبيك (Feature 8)
+            # الخروج الزمني وفق عمر النصف لنموذج أورنشتاين-أولينبيك
             ou_half_life = AdvancedQuantMath.calculate_ou_half_life(df_m1['close'].values)
             elapsed_minutes = (time.time() - self.entry_timestamps[deal_id]) / 60.0
             if elapsed_minutes > (ou_half_life * 2.0) and profit_pips < 1.0:
@@ -2333,7 +2329,7 @@ class MasterQuantSystem:
             TerminalLogger.filter(f"حظر إخباري لحظي: {news_msg}")
             return {"action": "NEWS_BLOCK", "reason": news_msg}
 
-        # 5. فحص سقف أزواج العملات المنفردة المفتوحة (Fix 4)
+        # 5. فحص سقف أزواج العملات المنفردة المفتوحة
         open_pos = self.broker.get_open_positions()
         distinct_open_epics = set(
             ep for ep in (p.get("market", {}).get("epic") or p.get("epic", "") for p in open_pos) if ep
@@ -2553,7 +2549,7 @@ class MasterQuantSystem:
                 slip_cap = MarketMicrostructureEngine.get_asymmetric_slippage_cap(best_opp["epic"], best_opp["atr_pips"])
                 live_bid, live_offer = self.broker.get_latest_quote(best_opp["epic"])
                 
-                # عزل السبريد ومطابقة Ask مع Ask و Bid مع Bid لمنع الرفض الكاذب لصفقات الشراء (Fix 1)
+                # عزل السبريد ومطابقة Ask مع Ask و Bid مع Bid بدقة
                 if best_opp["action"] == "BUY":
                     target_exec_price = live_offer if live_offer > 0 else best_opp["ask_price"]
                     drift_pips = abs(target_exec_price - best_opp["ask_price"]) / best_opp["pip_mult"]
@@ -2713,6 +2709,16 @@ class MasterQuantSystem:
 # ==============================================================================
 system = MasterQuantSystem()
 
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """معالج أخطاء تيليجرام لمنع رسائل No error handlers are registered"""
+    err = context.error
+    if isinstance(err, Conflict):
+        TerminalLogger.error("TELEGRAM_CONFLICT", "يوجد تطبيق آخر للبوت يعمل بنفس التوكن في نفس الوقت! أغلق العمليات المكررة.")
+    elif isinstance(err, NetworkError):
+        TerminalLogger.filter(f"خطأ اتصال مؤقت في شبكة تيليجرام: {err}")
+    else:
+        TerminalLogger.error("TELEGRAM_INTERNAL", str(err))
+
 async def send_priority_message(context: ContextTypes.DEFAULT_TYPE, text: str, urgent: bool = False):
     try:
         safe_text = text.replace("_", "-")
@@ -2803,11 +2809,14 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = "📊 **[نتائج الباكتيست من مستودع DuckDB المحلي]**\n\n"
     for epic, r in res.items():
-        msg += (
-            f"**• {epic}:**\n"
-            f"  ↳ العائد: `{r.get('return_pct')}%` | أقصى هبوط: `{r.get('max_dd')}%`\n"
-            f"  ↳ نسبة الفوز: `{r.get('win_rate')}%` | الصفقات: `{r.get('trades')}`\n\n"
-        )
+        if "return_pct" in r:
+            msg += (
+                f"**• {epic}:**\n"
+                f"  ↳ العائد: `{r.get('return_pct')}%` | أقصى هبوط: `{r.get('max_dd')}%`\n"
+                f"  ↳ نسبة الفوز: `{r.get('win_rate')}%` | الصفقات: `{r.get('trades')}`\n\n"
+            )
+        else:
+            msg += f"**• {epic}:** قيد تجميع الشموع (أقل من 60 شمعة)\n\n"
     try:
         await update.message.reply_text(msg.replace("_", "-"), parse_mode="Markdown")
     except Exception:
@@ -2881,13 +2890,18 @@ async def evolution_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧬 **[تقرير التدريب النظيف والباكتيست الذاتي الساعي]**\n\n"
         f"• التوقيت: `{last['timestamp']}`\n"
         f"• الحالة: {last['status']}\n\n"
-        "**نتائج الباكتيست اللحظي للعملات:**\n"
+        "**أداء سلة العملات في الباكتيست الأخير:**\n"
     )
     results = last.get("results", {})
-    for epic, r in results.items():
-        msg += (
-            f"• **{epic}:** ربح `{r.get('return_pct')}%` | فوز `{r.get('win_rate')}%` | هبوط `{r.get('max_dd')}%`\n"
-        )
+    if results:
+        for epic, r in results.items():
+            if "return_pct" in r:
+                msg += f"• **{epic}:** ربح `{r.get('return_pct')}%` | فوز `{r.get('win_rate')}%` | هبوط `{r.get('max_dd')}%`\n"
+            else:
+                msg += f"• **{epic}:** قيد تجميع الشموع (أقل من 60 شمعة)\n"
+    else:
+        msg += "↳ جاري تجميع الشموع في مستودع DuckDB (يتطلب 60 شمعة M1 لبدء الباكتيست الإحصائي).\n"
+
     try:
         await update.message.reply_text(msg.replace("_", "-"), parse_mode="Markdown")
     except Exception:
@@ -2950,10 +2964,8 @@ async def gemini_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ==============================================================================
 async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
     try:
-        # تسجيل نبضة اليقظة فورياً في أول سطر
         InternalSystemWatchdog.beat()
 
-        # الاصطفاف الزمني المحكم دون أي نوم مفرط يضيع الدورات
         now_sec = datetime.now(timezone.utc).second
         if now_sec < 42:
             await asyncio.sleep(42 - now_sec)
@@ -3078,10 +3090,14 @@ async def job_evolution_hourly(context: ContextTypes.DEFAULT_TYPE):
             f"• الحالة: {evo['status']}\n\n"
             "**أداء سلة العملات في الباكتيست الأخير:**\n"
         )
-        for epic, r in results.items():
-            msg += (
-                f"**• {epic}:** عائـد `{r.get('return_pct')}%` | فـوز `{r.get('win_rate')}%` | هبـوط `{r.get('max_dd')}%`\n"
-            )
+        if results:
+            for epic, r in results.items():
+                if "return_pct" in r:
+                    msg += f"**• {epic}:** عائـد `{r.get('return_pct')}%` | فـوز `{r.get('win_rate')}%` | هبـوط `{r.get('max_dd')}%`\n"
+                else:
+                    msg += f"**• {epic}:** قيد تجميع الشموع (أقل من 60 شمعة)\n"
+        else:
+            msg += "↳ جاري تجميع الشموع في مستودع DuckDB (يتطلب 60 شمعة M1 لبدء الباكتيست الإحصائي).\n"
         
         await send_priority_message(context, msg, urgent=False)
     except Exception as e:
@@ -3119,7 +3135,7 @@ async def job_health_heartbeat(context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 if __name__ == "__main__":
     print("\n" + "="*80)
-    print(" 🚀 Quant Institutional Multi-Asset Trading Engine (v5.5 Fully Hardened)")
+    print(" 🚀 Quant Institutional Multi-Asset Trading Engine (v5.6 Production Ready)")
     print(" 🛡️ Active Safety: Conformal ML | GARCH | Kalman | Hurst | Watchdog | Live Diagnostics")
     print("="*80 + "\n")
     
@@ -3128,6 +3144,9 @@ if __name__ == "__main__":
     InternalSystemWatchdog.start()
 
     app = ApplicationBuilder().token(Config.TELEGRAM_BOT_TOKEN).build()
+
+    # تسجيل معالج أخطاء تيليجرام لمنع الانهيارات غير المتوقعة
+    app.add_error_handler(telegram_error_handler)
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("autotrade_on", autotrade_on_cmd))
