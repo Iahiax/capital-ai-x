@@ -9,8 +9,11 @@ pip install duckdb psutil
 
 الطريقة الأولى (الأفضل والأسهل): استخدام NSSM (Non-Sucking Service Manager)
 هذه الأداة تحول أي سكربت بايثون إلى خدمة رسمية في ويندوز (Windows Service).
+
 1- قم بتحميل أداة NSSM (ملف مضغوط بحجم صغير جداً) من موقعها الرسمي وافتحه.
+
 2- انقل ملف ⁠nssm.exe⁠ إلى مجلد مشروع البوت.
+
 3- افتح موجه الأوامر (CMD) كمسؤول (Run as Administrator) في مجلد المشروع، ثم اكتب :
 nssm install QuantTraderBot
 
