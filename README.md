@@ -2,6 +2,9 @@
 
 pip install requests pandas numpy python-telegram-bot[job-queue] lightgbm catboost hmmlearn
 
+pip install requests urllib3 pandas numpy matplotlib python-telegram-bot[job-queue] lightgbm catboost hmmlearn
+
+
 الطريقة الأولى (الأفضل والأسهل): استخدام NSSM (Non-Sucking Service Manager)
 هذه الأداة تحول أي سكربت بايثون إلى خدمة رسمية في ويندوز (Windows Service).
 1- قم بتحميل أداة NSSM (ملف مضغوط بحجم صغير جداً) من موقعها الرسمي وافتحه.
