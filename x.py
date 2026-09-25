@@ -3,6 +3,7 @@ import io
 import re
 import ast
 import sys
+import gc
 import json
 import time
 import base64
@@ -15,7 +16,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # إعداد Matplotlib للعمل في الخلفية دون واجهات رسومية (Windows Service Safe)
 import matplotlib
@@ -86,7 +87,7 @@ class Config:
     DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market_warehouse.duckdb")
 
 # ==============================================================================
-# 2. مستودع البيانات المحلي فائق السرعة عبر DuckDB (مع التزامن الآمن)
+# 2. مستودع البيانات المحلي فائق السرعة عبر DuckDB (تزامن آمن)
 # ==============================================================================
 class DuckDBWarehouse:
     _db_lock = threading.Lock()
@@ -95,20 +96,22 @@ class DuckDBWarehouse:
     def init_database(cls):
         with cls._db_lock:
             con = duckdb.connect(Config.DB_FILE)
-            con.execute("""
-                CREATE TABLE IF NOT EXISTS m1_candles (
-                    epic VARCHAR,
-                    timestamp VARCHAR,
-                    open DOUBLE,
-                    high DOUBLE,
-                    low DOUBLE,
-                    close DOUBLE,
-                    ask_close DOUBLE,
-                    volume DOUBLE,
-                    PRIMARY KEY (epic, timestamp)
-                )
-            """)
-            con.close()
+            try:
+                con.execute("""
+                    CREATE TABLE IF NOT EXISTS m1_candles (
+                        epic VARCHAR,
+                        timestamp VARCHAR,
+                        open DOUBLE,
+                        high DOUBLE,
+                        low DOUBLE,
+                        close DOUBLE,
+                        ask_close DOUBLE,
+                        volume DOUBLE,
+                        PRIMARY KEY (epic, timestamp)
+                    )
+                """)
+            finally:
+                con.close()
 
     @classmethod
     def upsert_candles(cls, epic: str, df: pd.DataFrame):
@@ -116,35 +119,39 @@ class DuckDBWarehouse:
             return
         with cls._db_lock:
             con = duckdb.connect(Config.DB_FILE)
-            data_to_insert = df[['timestamp', 'open', 'high', 'low', 'close', 'ask_close', 'volume']].copy()
-            data_to_insert['epic'] = epic
-            con.register('df_view', data_to_insert)
-            con.execute("""
-                INSERT INTO m1_candles (epic, timestamp, open, high, low, close, ask_close, volume)
-                SELECT epic, timestamp, open, high, low, close, ask_close, volume FROM df_view
-                ON CONFLICT (epic, timestamp) DO UPDATE SET
-                    open = EXCLUDED.open,
-                    high = EXCLUDED.high,
-                    low = EXCLUDED.low,
-                    close = EXCLUDED.close,
-                    ask_close = EXCLUDED.ask_close,
-                    volume = EXCLUDED.volume
-            """)
-            con.close()
+            try:
+                data_to_insert = df[['timestamp', 'open', 'high', 'low', 'close', 'ask_close', 'volume']].copy()
+                data_to_insert['epic'] = epic
+                con.register('df_view', data_to_insert)
+                con.execute("""
+                    INSERT INTO m1_candles (epic, timestamp, open, high, low, close, ask_close, volume)
+                    SELECT epic, timestamp, open, high, low, close, ask_close, volume FROM df_view
+                    ON CONFLICT (epic, timestamp) DO UPDATE SET
+                        open = EXCLUDED.open,
+                        high = EXCLUDED.high,
+                        low = EXCLUDED.low,
+                        close = EXCLUDED.close,
+                        ask_close = EXCLUDED.ask_close,
+                        volume = EXCLUDED.volume
+                """)
+            finally:
+                con.close()
 
     @classmethod
     def get_cached_candles(cls, epic: str, limit=1000) -> pd.DataFrame:
         with cls._db_lock:
             con = duckdb.connect(Config.DB_FILE)
-            query = f"""
-                SELECT timestamp, open, high, low, close, ask_close, volume
-                FROM m1_candles
-                WHERE epic = '{epic}'
-                ORDER BY timestamp DESC
-                LIMIT {limit}
-            """
-            df = con.execute(query).df()
-            con.close()
+            try:
+                query = f"""
+                    SELECT timestamp, open, high, low, close, ask_close, volume
+                    FROM m1_candles
+                    WHERE epic = '{epic}'
+                    ORDER BY timestamp DESC
+                    LIMIT {limit}
+                """
+                df = con.execute(query).df()
+            finally:
+                con.close()
             if not df.empty:
                 return df.sort_values("timestamp").reset_index(drop=True)
             return pd.DataFrame()
@@ -157,7 +164,7 @@ class SystemHealthWatchdog:
     def get_metrics() -> dict:
         proc = psutil.Process(os.getpid())
         ram_mb = proc.memory_info().rss / (1024 * 1024)
-        cpu_pct = proc.cpu_percent(interval=None) # استدعاء غير متزامن بدون تجميد
+        cpu_pct = proc.cpu_percent(interval=None)
         uptime_sec = time.time() - proc.create_time()
         hours, remainder = divmod(uptime_sec, 3600)
         minutes, _ = divmod(remainder, 60)
@@ -171,7 +178,7 @@ class SystemHealthWatchdog:
         }
 
 # ==============================================================================
-# 4. وسيط Capital.com مع المعالجة اللحظية للنقاط وتجديد الجلسات
+# 4. وسيط Capital.com مع استخراج الأسعار واحتساب القيمة النقطية
 # ==============================================================================
 class FastCapitalBroker:
     def __init__(self):
@@ -187,6 +194,17 @@ class FastCapitalBroker:
     @staticmethod
     def get_pip_multiplier(epic: str) -> float:
         return 0.01 if "JPY" in epic.upper() else 0.0001
+
+    @classmethod
+    def get_pip_value_usd(cls, epic: str, current_price: float) -> float:
+        """
+        حساب قيمة النقطة الواحدة للوت القياسي (100,000 وحدة) بالدولار الأمريكي بدقة:
+        - أزواج العملات المباشرة (EURUSD, GBPUSD, AUDUSD): 1 pip = $10.
+        - أزواج الين (USDJPY): 1 pip = (100,000 * 0.01) / current_price = 1000 / price.
+        """
+        if "JPY" in epic.upper():
+            return 1000.0 / (current_price if current_price > 0 else 150.0)
+        return 10.0
 
     def get_server(self):
         return Config.DEMO_SERVER if self.demo else Config.LIVE_SERVER
@@ -218,7 +236,10 @@ class FastCapitalBroker:
             accounts = r.json().get("accounts", [])
             if accounts:
                 bal = accounts[0].get("balance", {})
-                return {"balance": float(bal.get("balance", 1000.0)), "available": float(bal.get("available", 1000.0))}
+                return {
+                    "balance": float(bal.get("balance") or 1000.0),
+                    "available": float(bal.get("available") or 1000.0)
+                }
         except Exception as e:
             print(f"[Account Details Error]: {e}")
         return {"balance": 1000.0, "available": 1000.0}
@@ -234,14 +255,24 @@ class FastCapitalBroker:
             data = r.json().get("prices", [])
             rows = []
             for p in data:
+                o_bid = (p.get("openPrice") or {}).get("bid")
+                h_bid = (p.get("highPrice") or {}).get("bid")
+                l_bid = (p.get("lowPrice") or {}).get("bid")
+                c_bid = (p.get("closePrice") or {}).get("bid")
+                c_ask = (p.get("closePrice") or {}).get("ask") or c_bid
+                vol_val = p.get("lastTradedVolume")
+
+                if None in (o_bid, h_bid, l_bid, c_bid):
+                    continue
+
                 rows.append({
-                    "timestamp": p["snapshotTime"],
-                    "open": float(p["openPrice"]["bid"]),
-                    "high": float(p["highPrice"]["bid"]),
-                    "low": float(p["lowPrice"]["bid"]),
-                    "close": float(p["closePrice"]["bid"]),
-                    "ask_close": float(p["closePrice"]["ask"]),
-                    "volume": float(p.get("lastTradedVolume", 1.0))
+                    "timestamp": p.get("snapshotTime", ""),
+                    "open": float(o_bid),
+                    "high": float(h_bid),
+                    "low": float(l_bid),
+                    "close": float(c_bid),
+                    "ask_close": float(c_ask if c_ask is not None else c_bid),
+                    "volume": float(vol_val if vol_val is not None else 1.0)
                 })
             df = pd.DataFrame(rows)
             if not df.empty and resolution == "MINUTE":
@@ -328,10 +359,11 @@ class MarketShield:
     @classmethod
     def check_live_news(cls) -> tuple[bool, str]:
         now_utc = datetime.now(timezone.utc)
-        today_str = now_utc.strftime("%Y-%m-%d")
+        from_str = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
+        to_str = (now_utc + timedelta(days=1)).strftime("%Y-%m-%d")
 
         try:
-            url_fmp = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={today_str}&to={today_str}&apikey={Config.FMP_API_KEY}"
+            url_fmp = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={from_str}&to={to_str}&apikey={Config.FMP_API_KEY}"
             resp = requests.get(url_fmp, timeout=4)
             if resp.status_code == 200:
                 events = resp.json()
@@ -349,7 +381,7 @@ class MarketShield:
             pass
 
         try:
-            url_fh = f"https://finnhub.io/api/v1/calendar/economic?from={today_str}&to={today_str}&token={Config.FINNHUB_API_KEY}"
+            url_fh = f"https://finnhub.io/api/v1/calendar/economic?from={from_str}&to={to_str}&token={Config.FINNHUB_API_KEY}"
             resp = requests.get(url_fh, timeout=4)
             if resp.status_code == 200:
                 events = resp.json().get("economicCalendar", [])
@@ -420,6 +452,8 @@ class HMMRegimeClassifier:
         return 1
 
 class HybridMetaLabeler:
+    FEATURE_NAMES = ["close", "vol", "mom", "cvd"]
+
     def __init__(self):
         self.lgb_model = None
         self.cb_model = None
@@ -443,20 +477,17 @@ class HybridMetaLabeler:
         if len(y) < 60 or len(np.unique(y)) < 2:
             return
 
-        X = features.values
-        Y = y.values
-
         if lgb is not None:
             try:
                 self.lgb_model = lgb.LGBMClassifier(n_estimators=30, learning_rate=0.05, max_depth=3, verbose=-1, random_state=42)
-                self.lgb_model.fit(X, Y)
+                self.lgb_model.fit(features, y)
             except Exception:
                 pass
 
         if CatBoostClassifier is not None:
             try:
                 self.cb_model = CatBoostClassifier(iterations=30, learning_rate=0.05, depth=3, verbose=False, random_seed=42)
-                self.cb_model.fit(X, Y)
+                self.cb_model.fit(features, y)
             except Exception:
                 pass
 
@@ -467,22 +498,23 @@ class HybridMetaLabeler:
             return 0.70
 
         probs = []
-        X = np.nan_to_num(feature_row.reshape(1, -1))
+        X_df = pd.DataFrame([feature_row], columns=self.FEATURE_NAMES).fillna(0.0)
+
         if self.lgb_model is not None:
             try:
-                probs.append(float(self.lgb_model.predict_proba(X)[0][1]))
+                probs.append(float(self.lgb_model.predict_proba(X_df)[0][1]))
             except Exception:
                 pass
         if self.cb_model is not None:
             try:
-                probs.append(float(self.cb_model.predict_proba(X)[0][1]))
+                probs.append(float(self.cb_model.predict_proba(X_df)[0][1]))
             except Exception:
                 pass
 
         return float(np.mean(probs)) if probs else 0.70
 
 # ==============================================================================
-# 7. إدارة المخاطر، الجلسات، وتحديد حجم العقود الصحيح
+# 7. إدارة المخاطر، الجلسات، وتحديد حجم العقود الدقيق
 # ==============================================================================
 class AdvancedRiskAndSessionManager:
     def __init__(self):
@@ -522,7 +554,7 @@ class AdvancedRiskAndSessionManager:
         else:
             return {"SMC": 0.30, "VWAP": 0.40, "MOM": 0.30, "session": "Late NY"}
 
-    def calculate_lot_size(self, equity: float, current_price: float) -> float:
+    def calculate_lot_size(self, epic: str, equity: float, current_price: float) -> float:
         if current_price <= 0 or np.isnan(current_price):
             current_price = 1.0850
 
@@ -532,11 +564,18 @@ class AdvancedRiskAndSessionManager:
 
         full_kelly = max(0.05, (0.58 * 2.5 - 0.42) / 2.5)
         risk_capital = equity * (full_kelly * active_kelly)
-        pip_risk = Config.DEFAULT_STOP_PIPS * 10.0
-        calculated_lots = risk_capital / pip_risk
         
-        # تصحيح: لوت الفوركس القياسي هو 100,000 وحدة لجميع الأزواج
-        max_possible_lots = (equity * Config.LEVERAGE * Config.MAX_MARGIN_USAGE_PCT) / (100000.0 * current_price)
+        # استخدام القيمة النقطية الديناميكية بالدولار لحجم العقد
+        pip_val_usd = FastCapitalBroker.get_pip_value_usd(epic, current_price)
+        pip_risk = Config.DEFAULT_STOP_PIPS * pip_val_usd
+        calculated_lots = risk_capital / (pip_risk if pip_risk > 0 else 40.0)
+        
+        buying_power = equity * Config.LEVERAGE * Config.MAX_MARGIN_USAGE_PCT
+        if epic.upper().startswith("USD"):
+            max_possible_lots = buying_power / 100000.0
+        else:
+            max_possible_lots = buying_power / (100000.0 * current_price)
+
         final_lot = max(0.01, min(calculated_lots, max_possible_lots))
         return round(float(final_lot), 2)
 
@@ -555,7 +594,7 @@ class MultiTimeframeAnalyzer:
         return 0, "اتجاه M15 محايد"
 
 # ==============================================================================
-# 8. المصادقة البصرية للشارت عبر Gemini Vision (استخلاص JSON الآمن)
+# 8. المصادقة البصرية للشارت عبر Gemini Vision مع حماية الذاكرة
 # ==============================================================================
 class GeminiChartVisionValidator:
     @staticmethod
@@ -564,23 +603,29 @@ class GeminiChartVisionValidator:
         v = vwap_series.tail(40).values
 
         fig, ax = plt.subplots(figsize=(6, 3), dpi=100)
-        fig.patch.set_facecolor('#0E1117')
-        ax.set_facecolor('#0E1117')
+        try:
+            fig.patch.set_facecolor('#0E1117')
+            ax.set_facecolor('#0E1117')
 
-        for i, row in d.iterrows():
-            color = '#00FF7F' if row['close'] >= row['open'] else '#FF3B30'
-            ax.plot([i, i], [row['low'], row['high']], color=color, linewidth=1)
-            ax.plot([i, i], [row['open'], row['close']], color=color, linewidth=3)
+            for i, row in d.iterrows():
+                color = '#00FF7F' if row['close'] >= row['open'] else '#FF3B30'
+                ax.plot([i, i], [row['low'], row['high']], color=color, linewidth=1)
+                ax.plot([i, i], [row['open'], row['close']], color=color, linewidth=3)
 
-        ax.plot(range(len(v)), v, color='#00BFFF', linestyle='--', linewidth=1.5, label="VWAP")
-        ax.axis('off')
-        plt.tight_layout()
+            ax.plot(range(len(v)), v, color='#00BFFF', linestyle='--', linewidth=1.5, label="VWAP")
+            ax.axis('off')
+            plt.tight_layout()
 
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', facecolor=fig.get_facecolor(), edgecolor='none')
-        plt.close(fig)
-        buf.seek(0)
-        return base64.b64encode(buf.read()).decode('utf-8')
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight', facecolor=fig.get_facecolor(), edgecolor='none')
+            buf.seek(0)
+            img_b64 = base64.b64encode(buf.read()).decode('utf-8')
+            return img_b64
+        finally:
+            plt.clf()
+            plt.close('all')
+            del fig, ax
+            gc.collect()
 
     @classmethod
     def validate_setup_with_vision(cls, epic: str, df_m1: pd.DataFrame, vwap_series: pd.Series, action: str, price: float) -> tuple[bool, str]:
@@ -608,12 +653,16 @@ class GeminiChartVisionValidator:
 
             r = requests.post(url, headers=headers, json=payload, timeout=8)
             if r.status_code == 200:
-                raw_text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                # اقتناص محتوى JSON بأمان حتى لو تضمن الرد كلاماً إضافياً
-                json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-                if json_match:
-                    data = json.loads(json_match.group(0))
-                    return (data.get("decision") == "APPROVE"), data.get("reason", "موافقة بصرية")
+                res_data = r.json()
+                candidates = res_data.get("candidates", [])
+                if candidates and "content" in candidates[0]:
+                    parts = candidates[0]["content"].get("parts", [])
+                    if parts and "text" in parts[0]:
+                        raw_text = parts[0]["text"].strip()
+                        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                        if json_match:
+                            data = json.loads(json_match.group(0))
+                            return (data.get("decision") == "APPROVE"), data.get("reason", "موافقة بصرية")
         except Exception as e:
             print(f"[Vision Warning - {epic}]: {e}")
         return True, "تم تخطي الفحص البصري"
@@ -638,7 +687,7 @@ GEMINI_FUNCTION_TOOLS = [
             },
             {
                 "name": "force_recalibrate_models",
-                "description": "إعادة تدريب نماذج التعلم الآلي CatBoost/LightGBM وتحديث أوزان الاستراتيجيات فورياً",
+                "description": "إعادة تدريب نماذج التعلم الآلي CatBoost/LightGBM وتحديث أوزان الاستراتيجيات فورياً لجميع الأزواج",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {}
@@ -742,7 +791,7 @@ class GeminiConversationalAgent:
                 elif func_name == "force_recalibrate_models":
                     evo_res = system_instance.train_and_evolve()
                     return (
-                        f"🧠 **[تمت إعادة المعايرة والتدريب الذاتي]**\n\n"
+                        f"🧠 **[تمت إعادة المعايرة والتدريب والباكتيست الذاتي لجميع الأزواج]**\n\n"
                         f"• الحالة: {evo_res.get('status')}"
                     )
 
@@ -770,7 +819,7 @@ class GeminiConversationalAgent:
             return f"تعذر استكمال المعالجة عبر Gemini: {e}"
 
 # ==============================================================================
-# 10. محرك النظام الرئيسي وتدوير العملات المتعددة
+# 10. محرك النظام الرئيسي وتدوير العملات والباكتيست الموحد
 # ==============================================================================
 class MasterQuantSystem:
     def __init__(self):
@@ -782,29 +831,79 @@ class MasterQuantSystem:
         self.risk_mgr = AdvancedRiskAndSessionManager()
         self.autotrade_active = False
         self.evolution_log = []
-        self.last_checked_deal_id = None
+        self.processed_deal_ids = set()
 
     def reconcile_closed_trades(self):
-        activities = self.broker.fetch_recent_closed_trades(limit=3)
+        activities = self.broker.fetch_recent_closed_trades(limit=5)
         for act in activities:
-            deal_id = act.get("dealId")
-            if deal_id and deal_id != self.last_checked_deal_id:
-                pnl = float(act.get("profitAndLoss", 0.0))
-                if pnl < 0:
-                    self.risk_mgr.consecutive_losses += 1
-                else:
-                    self.risk_mgr.consecutive_losses = 0
-                self.last_checked_deal_id = deal_id
+            details = act.get("details") if isinstance(act.get("details"), dict) else {}
+            deal_id = act.get("dealId") or details.get("dealId")
+            
+            if deal_id and deal_id not in self.processed_deal_ids:
+                pnl_val = act.get("profitAndLoss") or act.get("pnl") or details.get("profitAndLoss") or details.get("profit")
+                if pnl_val is not None:
+                    pnl = float(pnl_val)
+                    if pnl < 0:
+                        self.risk_mgr.consecutive_losses += 1
+                    else:
+                        self.risk_mgr.consecutive_losses = 0
+                self.processed_deal_ids.add(deal_id)
+
+    def run_single_asset_backtest(self, epic: str, df: pd.DataFrame) -> dict:
+        """
+        محرك باكتيست موحد ومتقن للزوج الواحد يأخذ بالاعتبار السبريد الحقيقي والقيمة النقطية
+        """
+        if len(df) < 150:
+            return {"status": "بيانات غير كافية"}
+
+        d = df.copy()
+        pip_mult = self.broker.get_pip_multiplier(epic)
+        
+        tp = (d['high'] + d['low'] + d['close']) / 3
+        vwap = (tp * d['volume']).cumsum() / (d['volume'].cumsum() + 1e-8)
+        std = (tp - vwap).rolling(30).std()
+        
+        vwap_sig = pd.Series(0, index=d.index)
+        vwap_sig[d['close'] < (vwap - 2.0 * std)] = 1
+        vwap_sig[d['close'] > (vwap + 2.0 * std)] = -1
+
+        mom_sig = np.sign(d['close'].pct_change(10)).fillna(0.0)
+        smc_sig = pd.Series(0, index=d.index)
+        smc_sig[d['close'] < d['close'].shift(20).rolling(20).min()] = 1
+        smc_sig[d['close'] > d['close'].shift(20).rolling(20).max()] = -1
+
+        signals = (smc_sig * 0.40) + (vwap_sig * 0.35) + (mom_sig * 0.25)
+        pos = pd.Series(0, index=d.index)
+        pos[signals > 0.40] = 1
+        pos[signals < -0.40] = -1
+
+        ret = d['close'].pct_change().shift(-1).fillna(0.0)
+        spread_cost = (0.8 * pip_mult) / d['close']
+        trade_changes = pos.diff().abs()
+        strat_ret = (pos * ret) - (trade_changes * spread_cost)
+
+        cum_ret = (1 + strat_ret * Config.LEVERAGE).cumprod()
+        dd = (cum_ret - cum_ret.cummax()) / cum_ret.cummax()
+        trades_count = int(trade_changes.sum() / 2)
+        winning_trades = int((strat_ret[trade_changes > 0] > 0).sum())
+        win_rate = (winning_trades / max(1, trades_count)) * 100
+        sharpe = (strat_ret.mean() / (strat_ret.std() + 1e-8)) * np.sqrt(1440 * 252)
+
+        return {
+            "return_pct": round(float(strat_ret.sum() * Config.LEVERAGE * 100), 2),
+            "max_dd": round(abs(float(dd.min())) * 100, 2),
+            "win_rate": round(win_rate, 1),
+            "trades": trades_count,
+            "sharpe": round(float(sharpe), 2)
+        }
 
     def scan_and_rotate_assets(self) -> dict:
         acc = self.broker.get_account_details()
 
-        # 1. فحص قاطع الهبوط اليومي
         cb_ok, cb_msg = self.risk_mgr.check_circuit_breakers(acc["balance"])
         if not cb_ok:
             return {"action": "CIRCUIT_BREAKER", "reason": cb_msg}
 
-        # 2. فحص مواعيد السوق والأخبار
         market_ok, market_msg = MarketShield.check_market_hours()
         if not market_ok:
             return {"action": "HALT", "reason": market_msg}
@@ -813,7 +912,6 @@ class MasterQuantSystem:
         if news_block:
             return {"action": "NEWS_BLOCK", "reason": news_msg}
 
-        # 3. منع تكديس الصفقات
         open_pos = self.broker.get_open_positions()
         if len(open_pos) > 0:
             return {"action": "IN_POSITION", "reason": "هناك صفقة قائمة تحت حماية الوقف المتحرك"}
@@ -821,7 +919,6 @@ class MasterQuantSystem:
         session_info = self.risk_mgr.get_dynamic_session_weights()
         qualified_opportunities = []
 
-        # 4. مسح سلة العملات بالكامل
         for epic in Config.ACTIVE_EPICS:
             pip_mult = self.broker.get_pip_multiplier(epic)
             df_m1 = self.broker.fetch_live_candles(epic, resolution="MINUTE", max_bars=100)
@@ -831,7 +928,6 @@ class MasterQuantSystem:
             last = df_m1.iloc[-1]
             live_spread_pips = (last['ask_close'] - last['close']) / pip_mult
 
-            # فلتر السبريد إلى المدى اللحظي
             tr = np.maximum(df_m1['high'] - df_m1['low'], 
                             np.maximum(abs(df_m1['high'] - df_m1['close'].shift(1)), 
                                        abs(df_m1['low'] - df_m1['close'].shift(1))))
@@ -885,7 +981,6 @@ class MasterQuantSystem:
                         "vwap": vwap
                     })
 
-        # 5. اختيار أفضل زوج وتأكيده بصرياً عبر Gemini
         if qualified_opportunities:
             best_opp = max(qualified_opportunities, key=lambda x: (x["prob"], x["score"]))
             
@@ -897,7 +992,7 @@ class MasterQuantSystem:
                 return {"action": "VISION_REJECTED", "reason": f"رفض بصري لزوج {best_opp['epic']}: {vision_reason}"}
 
             if self.autotrade_active:
-                lots = self.risk_mgr.calculate_lot_size(acc["available"], best_opp["price"])
+                lots = self.risk_mgr.calculate_lot_size(best_opp["epic"], acc["available"], best_opp["price"])
                 res = self.broker.execute_order_server_trailing(
                     epic=best_opp["epic"],
                     direction=best_opp["action"],
@@ -906,6 +1001,9 @@ class MasterQuantSystem:
                     stop_pips=Config.DEFAULT_STOP_PIPS,
                     profit_pips=Config.DEFAULT_PROFIT_PIPS
                 )
+                raw_ref = res.get("dealReference") or "OK"
+                clean_ref = re.sub(r'[^a-zA-Z0-9-]', '', str(raw_ref))
+
                 return {
                     "action": best_opp["action"],
                     "epic": best_opp["epic"],
@@ -913,7 +1011,7 @@ class MasterQuantSystem:
                     "lots": lots,
                     "prob": round(best_opp["prob"], 2),
                     "session": session_info["session"],
-                    "deal_ref": res.get("dealReference", "OK"),
+                    "deal_ref": clean_ref,
                     "reason": f"اقتناص أقوى فرصة بين العملات ({best_opp['epic']}) - مصادقة بصرية"
                 }
             else:
@@ -931,67 +1029,39 @@ class MasterQuantSystem:
         results = {}
         for epic in Config.ACTIVE_EPICS:
             df = DuckDBWarehouse.get_cached_candles(epic, limit=1000)
-            if len(df) < 150:
-                continue
-
-            d = df.copy()
-            pip_mult = self.broker.get_pip_multiplier(epic)
-            tp = (d['high'] + d['low'] + d['close']) / 3
-            vwap = (tp * d['volume']).cumsum() / (d['volume'].cumsum() + 1e-8)
-            std = (tp - vwap).rolling(30).std()
-            
-            vwap_sig = pd.Series(0, index=d.index)
-            vwap_sig[d['close'] < (vwap - 2.0 * std)] = 1
-            vwap_sig[d['close'] > (vwap + 2.0 * std)] = -1
-
-            mom_sig = np.sign(d['close'].pct_change(10)).fillna(0.0)
-            smc_sig = pd.Series(0, index=d.index)
-            smc_sig[d['close'] < d['close'].shift(20).rolling(20).min()] = 1
-            smc_sig[d['close'] > d['close'].shift(20).rolling(20).max()] = -1
-
-            # محاكاة مطابقة لأوزان الجلسات الحية
-            signals = (smc_sig * 0.40) + (vwap_sig * 0.35) + (mom_sig * 0.25)
-            pos = pd.Series(0, index=d.index)
-            pos[signals > 0.40] = 1
-            pos[signals < -0.40] = -1
-
-            ret = d['close'].pct_change().shift(-1).fillna(0.0)
-            spread_cost = (0.8 * pip_mult) / d['close']
-            trade_changes = pos.diff().abs()
-            strat_ret = (pos * ret) - (trade_changes * spread_cost)
-
-            cum_ret = (1 + strat_ret * Config.LEVERAGE).cumprod()
-            dd = (cum_ret - cum_ret.cummax()) / cum_ret.cummax()
-            trades_count = int(trade_changes.sum() / 2)
-            winning_trades = int((strat_ret[trade_changes > 0] > 0).sum())
-            win_rate = (winning_trades / max(1, trades_count)) * 100
-
-            results[epic] = {
-                "return_pct": round(float(strat_ret.sum() * Config.LEVERAGE * 100), 2),
-                "max_dd": round(abs(float(dd.min())) * 100, 2),
-                "win_rate": round(win_rate, 1),
-                "trades": trades_count
-            }
+            if len(df) >= 150:
+                results[epic] = self.run_single_asset_backtest(epic, df)
         return results
 
-    def train_and_evolve(self):
+    def train_and_evolve(self) -> dict:
+        """
+        دورة الباكتيست والتدريب الذاتي الشاملة لكل زوج عملة كل ساعة
+        """
         trained_epics = []
+        backtest_results = {}
+        
         for epic in Config.ACTIVE_EPICS:
             df = DuckDBWarehouse.get_cached_candles(epic, limit=1000)
-            if len(df) >= 200:
-                df = self.order_flow.calculate_volume_delta(df)
-                self.meta_labelers[epic].train_ensemble(df, self.broker.get_pip_multiplier(epic))
+            if len(df) >= 150:
+                # 1. تدريب نماذج التعلم الآلي للزوج
+                df_features = self.order_flow.calculate_volume_delta(df)
+                self.meta_labelers[epic].train_ensemble(df_features, self.broker.get_pip_multiplier(epic))
                 trained_epics.append(epic)
+                
+                # 2. تشغيل باكتيست فوري دقيق ومستقل للزوج
+                bt_metrics = self.run_single_asset_backtest(epic, df)
+                backtest_results[epic] = bt_metrics
         
         entry = {
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "status": f"تم تدريب النماذج وتحديث الميزات للأزواج: {', '.join(trained_epics)}"
+            "status": f"تم التدريب والباكتيست الذاتي لـ: {', '.join(trained_epics)}",
+            "results": backtest_results
         }
         self.evolution_log.append(entry)
         return entry
 
 # ==============================================================================
-# 11. أوامر التيليجرام التفاعلية المباشرة (مع تغليف الرموز الآمن)
+# 11. أوامر التيليجرام التفاعلية المباشرة
 # ==============================================================================
 system = MasterQuantSystem()
 
@@ -1011,7 +1081,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/backtest` - باكتيست فوري من مستودع DuckDB\n"
         "• `/status` - فحص المحفظة ومراكز التداول الحالية\n"
         "• `/health` - مراقبة صحة الخادم، الرام والمعالج (Watchdog)\n"
-        "• `/evolution` - تقرير تدريب نماذج التعلم الآلي\n"
+        "• `/evolution` - تقرير تدريب وباكتيست نماذج التعلم الآلي\n"
         "• `/news` - فحص مفكرة الأخبار الاقتصادية اللحظية\n\n"
         "💬 *يمكنك محادثة Gemini بالعربية أو توجيه أوامر مثل: 'اجعل وقف الخسارة 5 نقاط' أو 'أعد تدريب النماذج'!*"
     )
@@ -1039,7 +1109,7 @@ async def mode_live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ جاري إجراء الباكتيست الفوري من مستودع DuckDB لكافة الأزواج...")
-    res = system.run_full_backtest_duckdb()
+    res = await asyncio.to_thread(system.run_full_backtest_duckdb)
     if not res:
         await update.message.reply_text("لا توجد شموع كافية في مستودع DuckDB بعد. اترك البوت يعمل لدقائق لتجميع البيانات.")
         return
@@ -1047,8 +1117,9 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for epic, r in res.items():
         msg += (
             f"**• {epic}:**\n"
-            f"  ↳ العائد: `{r['return_pct']}%` | أقصى هبوط: `{r['max_dd']}%`\n"
-            f"  ↳ نسبة الفوز: `{r['win_rate']}%` | الصفقات: `{r['trades']}`\n\n"
+            f"  ↳ العائد: `{r.get('return_pct')}%` | أقصى هبوط: `{r.get('max_dd')}%`\n"
+            f"  ↳ نسبة الفوز: `{r.get('win_rate')}%` | الصفقات: `{r.get('trades')}`\n"
+            f"  ↳ معامل شارب: `{r.get('sharpe')}`\n\n"
         )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -1083,14 +1154,21 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def evolution_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not system.evolution_log:
-        await update.message.reply_text("جاري تدريب النماذج لأول مرة من مستودع DuckDB...")
-        system.train_and_evolve()
+        await update.message.reply_text("جاري تدريب النماذج والباكتيست الذاتي لأول مرة من مستودع DuckDB...")
+        await asyncio.to_thread(system.train_and_evolve)
     last = system.evolution_log[-1]
+    
     msg = (
-        "🧬 **[تقرير التدريب والتطوير الذاتي]**\n\n"
+        "🧬 **[تقرير التدريب والباكتيست الذاتي الساعي]**\n\n"
         f"• التوقيت: `{last['timestamp']}`\n"
-        f"• الحالة: {last['status']}"
+        f"• الحالة: {last['status']}\n\n"
+        "**نتائج الباكتيست اللحظي للعملات:**\n"
     )
+    results = last.get("results", {})
+    for epic, r in results.items():
+        msg += (
+            f"• **{epic}:** ربح `{r.get('return_pct')}%` | فوز `{r.get('win_rate')}%` | شارب `{r.get('sharpe')}`\n"
+        )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1133,10 +1211,10 @@ async def gemini_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ==============================================================================
 async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
     try:
-        system.reconcile_closed_trades()
-        res = system.scan_and_rotate_assets()
+        await asyncio.to_thread(system.reconcile_closed_trades)
+        res = await asyncio.to_thread(system.scan_and_rotate_assets)
+
         if res.get("action") in ["BUY", "SELL"]:
-            deal_ref_clean = str(res.get('deal_ref', 'OK')).replace("_", "\\_")
             msg = (
                 f"⚡ **[تنفيذ صفقة مؤسسية - تدوير العملات]**\n\n"
                 f"• الزوج المقتنص: `{res['epic']}`\n"
@@ -1146,7 +1224,16 @@ async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
                 f"• الجلسة: `{res.get('session', 'N/A')}`\n"
                 f"• احتمالية النجاح: `{res['prob']*100:.1f}%`\n"
                 f"• المصادقة البصرية: **معتمدة عبر Gemini Vision**\n"
-                f"• المرجع: `{deal_ref_clean}`"
+                f"• المرجع: `{res.get('deal_ref', 'OK')}`"
+            )
+            await context.bot.send_message(chat_id=Config.TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
+        elif res.get("action") == "SIGNAL_DETECTED":
+            msg = (
+                f"📡 **[رصد إشارة دخول - وضع المراقبة]**\n\n"
+                f"• الزوج: `{res['epic']}`\n"
+                f"• السعر: `{res['price']}`\n"
+                f"• الاحتمالية: `{res['prob']*100:.1f}%`\n"
+                f"• الحالة: {res['reason']}"
             )
             await context.bot.send_message(chat_id=Config.TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
         elif res.get("action") == "CIRCUIT_BREAKER":
@@ -1155,9 +1242,26 @@ async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
         print(f"[Scanner Job Error]: {e}")
 
 async def job_evolution_hourly(context: ContextTypes.DEFAULT_TYPE):
+    """
+    مهمة الباكتيست والتدريب الذاتي كل ساعة مع إرسال تقرير إحصائي كامل إلى تيليجرام
+    """
     try:
-        evo = system.train_and_evolve()
-        print(f"[Hourly Evolution]: {evo.get('status')}")
+        evo = await asyncio.to_thread(system.train_and_evolve)
+        results = evo.get("results", {})
+        
+        msg = (
+            "🧬 **[تقرير دوري آلي: التدريب والباكتيست الذاتي الساعي]**\n\n"
+            f"• التوقيت: `{evo['timestamp']}`\n"
+            f"• الحالة: {evo['status']}\n\n"
+            "**أداء سلة العملات في الباكتيست الأخير:**\n"
+        )
+        for epic, r in results.items():
+            msg += (
+                f"**• {epic}:** عائـد `{r.get('return_pct')}%` | فـوز `{r.get('win_rate')}%` | هبـوط `{r.get('max_dd')}%` | شـارب `{r.get('sharpe')}`\n"
+            )
+        
+        await context.bot.send_message(chat_id=Config.TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
+        print(f"[Hourly Evolution]: اكتمل التدريب والباكتيست لجميع الأزواج بنجاح.")
     except Exception as e:
         print(f"[Evolution Job Error]: {e}")
 
@@ -1198,7 +1302,7 @@ if __name__ == "__main__":
     # التحدث التفاعلي وتعديل النظام ذاتياً عبر Gemini
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), gemini_chat_handler))
 
-    # جدولة المهام: دقيقة لمسح العملات، ساعة للتدريب الذاتي، و12 ساعة لنبضة الصحة
+    # جدولة المهام: دقيقة لمسح العملات، ساعة للتدريب والباكتيست الذاتي، و12 ساعة لنبضة الصحة
     jq = app.job_queue
     jq.run_repeating(job_scanner_minute, interval=60, first=10)
     jq.run_repeating(job_evolution_hourly, interval=3600, first=30)
