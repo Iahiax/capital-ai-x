@@ -4,6 +4,8 @@ pip install requests pandas numpy python-telegram-bot[job-queue] lightgbm catboo
 
 pip install requests urllib3 pandas numpy matplotlib python-telegram-bot[job-queue] lightgbm catboost hmmlearn
 
+pip install duckdb psutil
+
 
 الطريقة الأولى (الأفضل والأسهل): استخدام NSSM (Non-Sucking Service Manager)
 هذه الأداة تحول أي سكربت بايثون إلى خدمة رسمية في ويندوز (Windows Service).
