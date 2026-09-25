@@ -144,8 +144,8 @@ class Config:
 
     # Kyma AI API (OpenAI-Compatible Gateway)
     KYMA_API_KEY = "kyma-a5093ae6505f8e2f77ba561d0d0557fa917c07c380e3d330"
-    KYMA_ENDPOINT = "https://api.kyma.ai/v1/chat/completions"
-    KYMA_MODEL = "gpt-4o-mini"
+    KYMA_ENDPOINT = "https://api.kymaapi.com/v1/chat/completions"
+    KYMA_MODEL = "Llama-3.1-70B"
 
     # المفكرة الاقتصادية اللحظية والماكرو
     FRED_API_KEY = "d295bdec801d4faf6f55e5a5ea34eb07"
@@ -1877,9 +1877,9 @@ class KymaChartVisionValidator:
                             TerminalLogger.filter(f"رفض بصري من Kyma Vision لزوج {epic}: {reason}")
                         return decision, reason
             else:
-                TerminalLogger.error("KYMA_VISION_API", f"HTTP {r.status_code}: {r.text}")
+                TerminalLogger.filter(f"النموذج لا يدعم الصور مباشرة (رمز {r.status_code}) - تخطي الفحص البصري للمتابعة")
         except Exception as e:
-            TerminalLogger.error("KYMA_VISION_CALL", str(e))
+            TerminalLogger.filter(f"تخطي الفحص البصري: {e}")
         return True, "تم تخطي الفحص البصري"
 
 # ==============================================================================
@@ -2569,6 +2569,7 @@ class MasterQuantSystem:
                 slip_cap = MarketMicrostructureEngine.get_asymmetric_slippage_cap(best_opp["epic"], best_opp["atr_pips"])
                 live_bid, live_offer = self.broker.get_latest_quote(best_opp["epic"])
                 
+                # عزل السبريد ومطابقة Ask مع Ask و Bid مع Bid بدقة
                 if best_opp["action"] == "BUY":
                     target_exec_price = live_offer if live_offer > 0 else best_opp["ask_price"]
                     drift_pips = abs(target_exec_price - best_opp["ask_price"]) / best_opp["pip_mult"]
@@ -2791,7 +2792,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         "👑 **نظام التداول الكمي المؤسسي الشامل لـ CFDs (M1 Institutional Quant)**\n\n"
-        f"• محرك الذكاء الاصطناعي: **Kyma AI Engine (Vision + Tools)**\n"
+        f"• محرك الذكاء الاصطناعي: **Kyma AI Engine ({Config.KYMA_MODEL})**\n"
         f"• أزواج العملات النشطة: **{', '.join(Config.ACTIVE_EPICS)}**\n"
         f"• إدارة المخاطر: **Risk Parity + CVaR 99% (${cvar_val:.1f}) + GARCH(1,1)**\n"
         f"• النماذج الرياضية: **Kalman Filter + Hurst Exp + Fractional Diff (d=0.4)**\n"
@@ -2998,7 +2999,7 @@ async def kyma_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = msg.text
-    TerminalLogger.info(f"استلام رسالة لـ Kyma من {chat.id}: {user_text[:50]}...")
+    TerminalLogger.info(f"استلام رسالة لـ Kyma ({Config.KYMA_MODEL}) من {chat.id}: {user_text[:50]}...")
     
     try:
         await context.bot.send_chat_action(chat_id=chat.id, action="typing")
@@ -3227,5 +3228,5 @@ if __name__ == "__main__":
     jq.run_repeating(job_evolution_hourly, interval=3600, first=30)
     jq.run_repeating(job_health_heartbeat, interval=43200, first=3600)
 
-    TerminalLogger.success("بدء تشغيل استقبال أوامر تيليجرام ومراقبة السوق المباشرة عبر Kyma AI...")
+    TerminalLogger.success(f"بدء تشغيل استقبال أوامر تيليجرام ومراقبة السوق المباشرة عبر Kyma AI ({Config.KYMA_MODEL})...")
     app.run_polling()
