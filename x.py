@@ -144,7 +144,7 @@ class Config:
 
     # Google Gemini API
     GEMINI_API_KEY = "AQ.Ab8RN6JevzXfPTK6MPgLXSeePc5ERTi0eONlQdTNqSv5P0McGA"
-    GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+    GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
     # المفكرة الاقتصادية اللحظية والماكرو
     FRED_API_KEY = "d295bdec801d4faf6f55e5a5ea34eb07"
@@ -941,6 +941,7 @@ class SyntheticDXYEngine:
             a = DuckDBWarehouse.get_cached_candles("AUDUSD", limit=30)
 
             if min(len(e), len(j), len(g), len(a)) >= 15:
+                # المحاذاة الزمنية المتزامنة للمؤشر التجميعي بدقة الدقيقة
                 e['t'] = e['timestamp'].astype(str).str.replace('T', ' ').str.slice(0, 16)
                 j['t'] = j['timestamp'].astype(str).str.replace('T', ' ').str.slice(0, 16)
                 g['t'] = g['timestamp'].astype(str).str.replace('T', ' ').str.slice(0, 16)
@@ -1834,7 +1835,10 @@ class GeminiChartVisionValidator:
                 return True, "تخطي الفحص (بيانات بصرية قليلة)"
 
             url = f"{Config.GEMINI_ENDPOINT}?key={Config.GEMINI_API_KEY}"
-            headers = {"Content-Type": "application/json"}
+            headers = {
+                "Content-Type": "application/json",
+                "x-goog-api-key": Config.GEMINI_API_KEY
+            }
 
             prompt = (
                 f"You are a quant execution risk controller. We want to enter '{action}' on {epic} at {price}. "
@@ -1931,7 +1935,10 @@ class GeminiConversationalAgent:
     @staticmethod
     def ask_and_execute(user_message: str, system_instance, system_context: dict) -> str:
         url = f"{Config.GEMINI_ENDPOINT}?key={Config.GEMINI_API_KEY}"
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": Config.GEMINI_API_KEY
+        }
 
         system_instruction = f"""
 أنت المهندس الكمي والمشرف الرئيسي على نظام التداول الآلي المؤسسي الشامل لـ CFDs على فريم M1.
@@ -1966,7 +1973,7 @@ class GeminiConversationalAgent:
             r = requests.post(url, headers=headers, json=payload, timeout=12)
             if r.status_code != 200:
                 TerminalLogger.error("GEMINI_CHAT_API", f"HTTP {r.status_code}: {r.text}")
-                return f"عذراً، حدث خطأ في الاتصال بمحرك Gemini (رمز {r.status_code})."
+                return f"عذراً، حدث خطأ في الاتصال بمحرك Gemini (رمز {r.status_code}). تأكد من صلاحية المفتاح والاتصال."
 
             res_json = r.json()
             candidates = res_json.get("candidates", [])
@@ -2710,14 +2717,39 @@ class MasterQuantSystem:
 system = MasterQuantSystem()
 
 async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """معالج أخطاء تيليجرام لمنع رسائل No error handlers are registered"""
     err = context.error
     if isinstance(err, Conflict):
-        TerminalLogger.error("TELEGRAM_CONFLICT", "يوجد تطبيق آخر للبوت يعمل بنفس التوكن في نفس الوقت! أغلق العمليات المكررة.")
+        TerminalLogger.error("TELEGRAM_CONFLICT", "⚠️ تعارض: يوجد كود آخر يعمل بنفس التوكن في الخلفية! أغلق العمليات السابقة فوراً.")
     elif isinstance(err, NetworkError):
         TerminalLogger.filter(f"خطأ اتصال مؤقت في شبكة تيليجرام: {err}")
     else:
         TerminalLogger.error("TELEGRAM_INTERNAL", str(err))
+
+async def reply_safe(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """إرسال آمن لرسائل التيليجرام يعمل مع المحادثات الخاصة، المجموعات، والقنوات دون انهيار"""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat:
+        return
+    safe_text = text.replace("_", "-")
+    try:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=safe_text,
+            parse_mode="Markdown",
+            reply_to_message_id=msg.message_id if msg else None
+        )
+    except Exception:
+        try:
+            clean_plain = re.sub(r'[*_`\[\]]', '', text)
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=clean_plain,
+                parse_mode=None,
+                reply_to_message_id=msg.message_id if msg else None
+            )
+        except Exception as e:
+            TerminalLogger.error("REPLY_SAFE_FALLBACK", str(e))
 
 async def send_priority_message(context: ContextTypes.DEFAULT_TYPE, text: str, urgent: bool = False):
     try:
@@ -2774,38 +2806,35 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/news` - فحص مفكرة الأخبار وتثبيت لندن\n\n"
         "💬 *يمكنك محادثة Gemini بالعربية أو توجيه أوامر مثل: 'عدل مضاعف وقف ATR إلى 2' أو 'أعد تدريب النماذج'!*"
     )
-    try:
-        await update.message.reply_text(msg.replace("_", "-"), parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(re.sub(r'[*_`\[\]]', '', msg), parse_mode=None)
+    await reply_safe(update, context, msg)
 
 async def autotrade_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system.autotrade_active = True
     TerminalLogger.success("تم تفعيل التداول الآلي عبر تيليجرام.")
-    await update.message.reply_text("🚀 **تم تفعيل التداول الآلي المؤسسي متعدد العملات.**", parse_mode="Markdown")
+    await reply_safe(update, context, "🚀 **تم تفعيل التداول الآلي المؤسسي متعدد العملات.**")
 
 async def autotrade_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system.autotrade_active = False
     TerminalLogger.info("تم إيقاف التداول الآلي عبر تيليجرام.")
-    await update.message.reply_text("🛑 **تم إيقاف التداول الآلي مؤقتاً.**", parse_mode="Markdown")
+    await reply_safe(update, context, "🛑 **تم إيقاف التداول الآلي مؤقتاً.**")
 
 async def mode_demo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system.broker.demo = True
     Config.DEMO_MODE = True
     system.broker.login()
-    await update.message.reply_text("✅ **تم التبديل للحساب التجريبي (DEMO).**", parse_mode="Markdown")
+    await reply_safe(update, context, "✅ **تم التبديل للحساب التجريبي (DEMO).**")
 
 async def mode_live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system.broker.demo = False
     Config.DEMO_MODE = False
     system.broker.login()
-    await update.message.reply_text("⚠️ **تحذير: تم التبديل للحساب الحقيقي (LIVE)! سيتم استخدام أموال حقيقية.**", parse_mode="Markdown")
+    await reply_safe(update, context, "⚠️ **تحذير: تم التبديل للحساب الحقيقي (LIVE)! سيتم استخدام أموال حقيقية.**")
 
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ جاري إجراء الباكتيست الفوري من مستودع DuckDB لكافة الأزواج...")
+    await reply_safe(update, context, "⏳ جاري إجراء الباكتيست الفوري من مستودع DuckDB لكافة الأزواج...")
     res = await asyncio.to_thread(system.run_full_backtest_duckdb)
     if not res:
-        await update.message.reply_text("لا توجد شموع كافية في مستودع DuckDB بعد. اترك البوت يعمل لدقائق لتجميع البيانات.")
+        await reply_safe(update, context, "لا توجد شموع كافية في مستودع DuckDB بعد. اترك البوت يعمل لدقائق لتجميع البيانات.")
         return
     msg = "📊 **[نتائج الباكتيست من مستودع DuckDB المحلي]**\n\n"
     for epic, r in res.items():
@@ -2817,10 +2846,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             msg += f"**• {epic}:** قيد تجميع الشموع (أقل من 60 شمعة)\n\n"
-    try:
-        await update.message.reply_text(msg.replace("_", "-"), parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(re.sub(r'[*_`\[\]]', '', msg), parse_mode=None)
+    await reply_safe(update, context, msg)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     acc = system.broker.get_account_details()
@@ -2855,10 +2881,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• المراكز المفتوحة: `{len(open_p)} عقد ({len(distinct_open_epics)}/{Config.MAX_OPEN_POSITIONS} زوج)`\n"
         f"• التداول الآلي: **{'نشط ✅' if system.autotrade_active else 'معطل ⏸'}**"
     )
-    try:
-        await update.message.reply_text(msg.replace("_", "-"), parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(re.sub(r'[*_`\[\]]', '', msg), parse_mode=None)
+    await reply_safe(update, context, msg)
 
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     h = InternalSystemWatchdog.get_metrics()
@@ -2875,14 +2898,11 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• مؤقت اليقظة الذاتي: **نشط ويراقب الخدمة (Watchdog OK) 🛡️**\n"
         f"• مستودع DuckDB: **قفل المعالجة المتبادل نشط (Thread-Safe Lock) ✅**"
     )
-    try:
-        await update.message.reply_text(msg.replace("_", "-"), parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(re.sub(r'[*_`\[\]]', '', msg), parse_mode=None)
+    await reply_safe(update, context, msg)
 
 async def evolution_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not system.evolution_log:
-        await update.message.reply_text("جاري تدريب النماذج والباكتيست الذاتي لأول مرة من مستودع DuckDB...")
+        await reply_safe(update, context, "جاري تدريب النماذج والباكتيست الذاتي لأول مرة من مستودع DuckDB...")
         await asyncio.to_thread(system.train_and_evolve)
     last = system.evolution_log[-1]
     
@@ -2890,7 +2910,7 @@ async def evolution_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧬 **[تقرير التدريب النظيف والباكتيست الذاتي الساعي]**\n\n"
         f"• التوقيت: `{last['timestamp']}`\n"
         f"• الحالة: {last['status']}\n\n"
-        "**أداء سلة العملات في الباكتيست الأخير:**\n"
+        "**نتائج الباكتيست اللحظي للعملات:**\n"
     )
     results = last.get("results", {})
     if results:
@@ -2902,10 +2922,7 @@ async def evolution_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg += "↳ جاري تجميع الشموع في مستودع DuckDB (يتطلب 60 شمعة M1 لبدء الباكتيست الإحصائي).\n"
 
-    try:
-        await update.message.reply_text(msg.replace("_", "-"), parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(re.sub(r'[*_`\[\]]', '', msg), parse_mode=None)
+    await reply_safe(update, context, msg)
 
 async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     blocked, news_msg = MarketShield.check_live_news()
@@ -2923,14 +2940,21 @@ async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• حالة جلسة السوق: **{'مفتوح ✅' if market_ok else 'مغلق ⏸'}**\n"
         f"  ↳ {market_msg}"
     )
-    try:
-        await update.message.reply_text(msg.replace("_", "-"), parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(re.sub(r'[*_`\[\]]', '', msg), parse_mode=None)
+    await reply_safe(update, context, msg)
 
 async def gemini_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    await update.message.reply_chat_action("typing")
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not msg.text:
+        return
+
+    user_text = msg.text
+    TerminalLogger.info(f"استلام رسالة لـ Gemini من {chat.id}: {user_text[:50]}...")
+    
+    try:
+        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+    except Exception:
+        pass
 
     acc = system.broker.get_account_details()
     open_pos = system.broker.get_open_positions()
@@ -2954,10 +2978,49 @@ async def gemini_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     }
 
     reply = await asyncio.to_thread(GeminiConversationalAgent.ask_and_execute, user_text, system, system_ctx)
-    try:
-        await update.message.reply_text(reply.replace("_", "-"), parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(re.sub(r'[*_`\[\]]', '', reply), parse_mode=None)
+    await reply_safe(update, context, reply)
+
+# ==============================================================================
+# الموجّه الموحد للأوامر والرسائل (Universal Message & Command Router)
+# يعمل بفعالية مطلقة 100% في المحادثات الخاصة والمجموعات والقنوات
+# ==============================================================================
+async def universal_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not msg.text:
+        return
+
+    raw_text = msg.text.strip()
+    
+    # 1. إذا كانت الرسالة أمراً يبدأ بـ /
+    if raw_text.startswith('/'):
+        cmd = raw_text.split()[0].lower().split('@')[0]
+        TerminalLogger.info(f"استلام أمر: {cmd} من المحادثة {chat.id}")
+        
+        if cmd == '/start':
+            await start_cmd(update, context)
+        elif cmd == '/autotrade_on':
+            await autotrade_on_cmd(update, context)
+        elif cmd == '/autotrade_off':
+            await autotrade_off_cmd(update, context)
+        elif cmd == '/mode_demo':
+            await mode_demo_cmd(update, context)
+        elif cmd == '/mode_live':
+            await mode_live_cmd(update, context)
+        elif cmd == '/backtest':
+            await backtest_cmd(update, context)
+        elif cmd == '/status':
+            await status_cmd(update, context)
+        elif cmd == '/health':
+            await health_cmd(update, context)
+        elif cmd == '/evolution':
+            await evolution_cmd(update, context)
+        elif cmd == '/news':
+            await news_cmd(update, context)
+        return
+
+    # 2. إذا كانت رسالة محادثة عادية -> توجيهها فوراً لمحرك Gemini
+    await gemini_chat_handler(update, context)
 
 # ==============================================================================
 # 17. مهام الجدولة اللحظية والساعية وتصنيف الإشعارات
@@ -3093,9 +3156,9 @@ async def job_evolution_hourly(context: ContextTypes.DEFAULT_TYPE):
         if results:
             for epic, r in results.items():
                 if "return_pct" in r:
-                    msg += f"**• {epic}:** عائـد `{r.get('return_pct')}%` | فـوز `{r.get('win_rate')}%` | هبـوط `{r.get('max_dd')}%`\n"
+                    msg += f"• **{epic}:** ربح `{r.get('return_pct')}%` | فوز `{r.get('win_rate')}%` | هبوط `{r.get('max_dd')}%`\n"
                 else:
-                    msg += f"**• {epic}:** قيد تجميع الشموع (أقل من 60 شمعة)\n"
+                    msg += f"• **{epic}:** قيد تجميع الشموع (أقل من 60 شمعة)\n"
         else:
             msg += "↳ جاري تجميع الشموع في مستودع DuckDB (يتطلب 60 شمعة M1 لبدء الباكتيست الإحصائي).\n"
         
@@ -3135,7 +3198,7 @@ async def job_health_heartbeat(context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 if __name__ == "__main__":
     print("\n" + "="*80)
-    print(" 🚀 Quant Institutional Multi-Asset Trading Engine (v5.6 Production Ready)")
+    print(" 🚀 Quant Institutional Multi-Asset Trading Engine (v5.5 Fully Hardened)")
     print(" 🛡️ Active Safety: Conformal ML | GARCH | Kalman | Hurst | Watchdog | Live Diagnostics")
     print("="*80 + "\n")
     
@@ -3145,21 +3208,11 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(Config.TELEGRAM_BOT_TOKEN).build()
 
-    # تسجيل معالج أخطاء تيليجرام لمنع الانهيارات غير المتوقعة
+    # معالج أخطاء تيليجرام
     app.add_error_handler(telegram_error_handler)
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("autotrade_on", autotrade_on_cmd))
-    app.add_handler(CommandHandler("autotrade_off", autotrade_off_cmd))
-    app.add_handler(CommandHandler("mode_demo", mode_demo_cmd))
-    app.add_handler(CommandHandler("mode_live", mode_live_cmd))
-    app.add_handler(CommandHandler("backtest", backtest_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("health", health_cmd))
-    app.add_handler(CommandHandler("evolution", evolution_cmd))
-    app.add_handler(CommandHandler("news", news_cmd))
-
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), gemini_chat_handler))
+    # معالج شامل لكل الأوامر والرسائل النصية في كل مكان (خاص، مجموعات، وقنوات)
+    app.add_handler(MessageHandler(filters.TEXT, universal_message_router))
 
     jq = app.job_queue
     jq.run_repeating(job_scanner_minute, interval=60, first=10)
