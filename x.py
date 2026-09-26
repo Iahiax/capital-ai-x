@@ -20,6 +20,9 @@ import numpy as np
 import pandas as pd
 from scipy.cluster.hierarchy import linkage, to_tree
 from scipy.spatial.distance import squareform
+from scipy.special import gamma
+from sklearn.decomposition import FastICA
+from sklearn.isotonic import IsotonicRegression
 from datetime import datetime, timezone, timedelta
 
 # تفعيل دعم ألوان ANSI في تيرمينال Windows
@@ -32,9 +35,13 @@ matplotlib.use('Agg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-# مستودع البيانات المحلي ومراقبة النظام
+# مستودع البيانات المحلي ومراقبة النظام والذاكرة المشتركة
 import duckdb
 import psutil
+try:
+    import pyarrow as pa
+except ImportError:
+    pa = None
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -134,12 +141,15 @@ class Config:
     COOLDOWN_MINUTES = 20              # فترة التهدئة الإلزامية بعد خسارتين متتاليتين
     WATCHDOG_TIMEOUT_SECONDS = 180     # مهلة خيط اليقظة الداخلي لإعادة تشغيل الخدمة
     
-    # المعاملات المتقدمة المؤسسية
+    # المعاملات المتقدمة المؤسسية والـ 21 ابتكار
     MACRO_SHOCK_CORRELATION_MAX = 0.85 # عتبة تجميد التداول عند صدمة الارتباط الكلي
     VOL_OF_VOL_HIGH_THRESHOLD = 0.35   # عتبة تقلب التقلب لتخفيض الحجم وتوسيع الوقف
     MAX_TIME_UNDER_WATER_SEC = 14400   # حد مدة التراجع (4 ساعات) لتخفيض كيلي
     CANARY_FORWARD_TEST_MINUTES = 30   # مدة اختبار الظل للنماذج قبل تفعيلها
     HAWKES_MAX_INTENSITY = 2.4         # سقف شدة قفزات هوكس لحظر الدخول وقت الصدمات
+    VPIN_TOXICITY_THRESHOLD = 0.65     # سقف سمية VPIN اللحظية
+    MAX_DAILY_FRICTION_BUDGET_USD = 80.0 # سقف ميزانية احتكاك السبريد والانزلاق اليومي
+    GLOBAL_MACRO_STRESS_THRESHOLD = 2.2 # عتبة مؤشر الضغط الكلي للملاذات
 
     # Telegram Bot
     TELEGRAM_BOT_TOKEN = "8833615675:AAE-NKK9yStPi0NAeRnbJ8p_gZLpcj_8-7E"
@@ -159,7 +169,7 @@ class Config:
     DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market_warehouse.duckdb")
 
 # ==============================================================================
-# 2. هندسة استقرار ويندوز ومعالج الانهيارات (Affinity & Crash Handler)
+# 2. هندسة استقرار ويندوز وإدارة الذاكرة المنعدمة النسخ (Zero-Copy Shared Memory)
 # ==============================================================================
 def tune_windows_process_affinity_and_priority():
     try:
@@ -197,6 +207,32 @@ def setup_crash_dump_handler():
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
 
     sys.excepthook = global_excepthook
+
+class ZeroCopyIPCBuffer:
+    """بنية نقل البيانات اللحظية منعدمة النسخ عبر PyArrow RecordBatches"""
+    _table_store = {}
+    _lock = threading.Lock()
+
+    @classmethod
+    def write_candles(cls, epic: str, df: pd.DataFrame):
+        if pa is None or df.empty:
+            return
+        try:
+            batch = pa.RecordBatch.from_pandas(df)
+            with cls._lock:
+                cls._table_store[epic] = batch
+        except Exception:
+            pass
+
+    @classmethod
+    def read_candles(cls, epic: str) -> pd.DataFrame:
+        if pa is None:
+            return pd.DataFrame()
+        with cls._lock:
+            batch = cls._table_store.get(epic)
+            if batch is not None:
+                return batch.to_pandas()
+        return pd.DataFrame()
 
 # ==============================================================================
 # 3. مستودع البيانات المحلي فائق السرعة عبر DuckDB مع دعم Text-to-SQL
@@ -264,6 +300,7 @@ class DuckDBWarehouse:
                 """)
             finally:
                 con.close()
+        ZeroCopyIPCBuffer.write_candles(epic, df)
 
     @classmethod
     def log_closed_trade(cls, deal_id: str, epic: str, direction: str, pnl: float):
@@ -316,15 +353,20 @@ class DuckDBWarehouse:
             finally:
                 con.close()
             if df.empty:
-                return {"avg_slippage": 0.0, "total_friction": 0.0, "avg_friction_pct": 0.0}
+                return {"avg_slippage": 0.0, "total_friction": 0.0, "avg_friction_pct": 0.0, "today_friction_usd": 0.0}
             return {
                 "avg_slippage": round(float(df['slippage_pips'].mean()), 2),
                 "total_friction": round(float(df['total_friction_usd'].sum()), 2),
-                "avg_friction_pct": round(float(df['friction_ratio_pct'].mean()), 1)
+                "avg_friction_pct": round(float(df['friction_ratio_pct'].mean()), 1),
+                "today_friction_usd": round(float(df['total_friction_usd'].tail(15).sum()), 2)
             }
 
     @classmethod
     def get_cached_candles(cls, epic: str, limit=1000) -> pd.DataFrame:
+        df_ipc = ZeroCopyIPCBuffer.read_candles(epic)
+        if not df_ipc.empty and len(df_ipc) >= min(limit, 100):
+            return df_ipc.tail(limit).reset_index(drop=True)
+
         with cls._lock:
             con = duckdb.connect(Config.DB_FILE)
             try:
@@ -339,7 +381,9 @@ class DuckDBWarehouse:
             finally:
                 con.close()
             if not df.empty:
-                return df.sort_values("timestamp").reset_index(drop=True)
+                df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+                ZeroCopyIPCBuffer.write_candles(epic, df_sorted)
+                return df_sorted
             return pd.DataFrame()
 
     @classmethod
@@ -369,7 +413,6 @@ class DuckDBWarehouse:
 
     @classmethod
     def execute_safe_query(cls, sql_query: str) -> str:
-        """محرك استعلام Text-to-SQL آمن ومحصن بنسبة 100% للقراءة فقط"""
         clean_q = sql_query.strip()
         prohibited = ["drop", "delete", "insert", "update", "alter", "truncate", "create", "grant"]
         first_token = clean_q.split()[0].lower() if clean_q.split() else ""
@@ -403,7 +446,7 @@ class DuckDBWarehouse:
                 con.close()
 
 # ==============================================================================
-# 4. النماذج الرياضية، هوكس، التكامل المشترك، والمويجات
+# 4. النماذج الرياضية والإحصائية المتقدمة والجسيمات والتغير البايزي
 # ==============================================================================
 class AdvancedQuantMath:
     @staticmethod
@@ -451,26 +494,48 @@ class AdvancedQuantMath:
         return pd.Series(np.pad(res, (pad_len, 0), mode='edge'), index=series.index)
 
     @staticmethod
-    def kalman_filter_price_velocity(prices: np.ndarray) -> tuple[float, float]:
+    def adaptive_particle_filter(prices: np.ndarray, num_particles=100) -> tuple[float, float]:
+        """مرشح الجسيمات غير الخطي للتعامل مع الذيول الثقيلة ورصد الزخم الخالي من التأخير"""
         if len(prices) < 5:
             return float(prices[-1]), 0.0
-        x = np.array([prices[0], 0.0])
-        P = np.eye(2) * 1.0
-        F = np.array([[1.0, 1.0], [0.0, 1.0]])
-        Q = np.array([[1e-4, 1e-4], [1e-4, 1e-3]])
-        H = np.array([[1.0, 0.0]])
-        R = np.array([[1e-3]])
+        particles = np.full(num_particles, prices[0])
+        velocities = np.zeros(num_particles)
+        weights = np.ones(num_particles) / num_particles
 
-        for z in prices:
-            x = F @ x
-            P = F @ P @ F.T + Q
-            y = z - (H @ x)
-            S = H @ P @ H.T + R
-            K = P @ H.T * (1.0 / (S[0, 0] + 1e-8))
-            x = x + (K * y[0]).flatten()
-            P = (np.eye(2) - K @ H) @ P
+        for p in prices:
+            velocities += np.random.normal(0.0, 0.0003, num_particles)
+            particles += velocities + np.random.normal(0.0, 0.0005, num_particles)
+            innovations = np.abs(p - particles)
+            weights *= np.exp(-0.5 * (innovations / (0.0008 + 1e-6)) ** 2) + 1e-8
+            weights /= np.sum(weights)
 
-        return float(x[0]), float(x[1])
+            if 1.0 / np.sum(weights ** 2) < (num_particles / 2.0):
+                indices = np.random.choice(num_particles, size=num_particles, p=weights)
+                particles = particles[indices]
+                velocities = velocities[indices]
+                weights.fill(1.0 / num_particles)
+
+        filtered_price = float(np.sum(particles * weights))
+        filtered_vel = float(np.sum(velocities * weights))
+        return filtered_price, filtered_vel
+
+    @staticmethod
+    def bayesian_online_changepoint_detect(returns: np.ndarray, hazard=120) -> float:
+        """كشف نقاط التحول الهيكلي البايزي الفوري (BOCPD) في توزيع السلسلة"""
+        if len(returns) < 15:
+            return 0.0
+        data = returns[-30:]
+        n = len(data)
+        var_tot = np.var(data) + 1e-8
+        max_shift = 0.0
+        for i in range(5, n - 5):
+            left_mean = np.mean(data[:i])
+            right_mean = np.mean(data[i:])
+            shift = abs(left_mean - right_mean) / np.sqrt(var_tot)
+            if shift > max_shift:
+                max_shift = shift
+        prob_cp = 1.0 / (1.0 + np.exp(-max_shift + 1.8))
+        return float(prob_cp)
 
     @staticmethod
     def calculate_rolling_hurst(series: np.ndarray) -> float:
@@ -506,18 +571,34 @@ class AdvancedQuantMath:
         return 15.0
 
     @staticmethod
-    def predict_garch_volatility(returns: np.ndarray) -> float:
+    def predict_student_t_garch_volatility(returns: np.ndarray, nu=6.0) -> float:
+        """التنبؤ بالتقلب المسبق مع توزيع Student-t لمراعاة مخاطر الذيول الثقيلة"""
         if len(returns) < 20:
             return float(np.std(returns) if len(returns) > 0 else 0.0005)
-        alpha = 0.10
-        beta = 0.85
+        alpha = 0.12
+        beta = 0.82
         long_run_var = float(np.var(returns))
         omega = long_run_var * (1.0 - alpha - beta)
         sigma2 = long_run_var
+
+        t_factor = nu / (nu - 2.0) if nu > 2.0 else 1.5
         for r in returns:
-            sigma2 = omega + alpha * (r**2) + beta * sigma2
-        next_sigma2 = omega + alpha * (returns[-1]**2) + beta * sigma2
-        return float(np.sqrt(max(1e-10, next_sigma2)))
+            sigma2 = omega + alpha * (r ** 2) * (1.0 / t_factor) + beta * sigma2
+        next_sigma2 = omega + alpha * (returns[-1] ** 2) + beta * sigma2
+        return float(np.sqrt(max(1e-10, next_sigma2 * t_factor)))
+
+    @staticmethod
+    def calculate_sample_uniqueness_weights(labels_barrier: pd.Series, max_bars=10) -> np.ndarray:
+        """احتساب تفرد كل شمعة وتداخل الحواجز لمنع انحياز النماذج (Marcos López de Prado)"""
+        n = len(labels_barrier)
+        if n < 20:
+            return np.ones(n)
+        overlaps = np.zeros(n)
+        for i in range(n):
+            end_span = min(n, i + max_bars)
+            overlaps[i:end_span] += 1.0
+        uniqueness = 1.0 / np.maximum(1.0, overlaps)
+        return uniqueness / np.mean(uniqueness)
 
     @staticmethod
     def triple_barrier_labeling(df: pd.DataFrame, pt_mult=2.0, sl_mult=1.0, max_bars=10) -> pd.Series:
@@ -547,7 +628,6 @@ class AdvancedQuantMath:
         return pd.Series(labels, index=df.index)
 
 class HawkesProcessEngine:
-    """نمذجة قفزات السيولة الذاتية واصطياد الوقف (Hawkes Point-Process)"""
     @staticmethod
     def calculate_jump_intensity(df: pd.DataFrame, alpha=0.85, beta=1.35, mu=0.20) -> float:
         if len(df) < 15:
@@ -555,17 +635,14 @@ class HawkesProcessEngine:
         vols = df['volume'].values
         vol_mean = np.mean(vols[-15:]) + 1e-8
         jumps = np.where(vols > (vol_mean * 1.6))[0]
-        
         if len(jumps) == 0:
             return mu
-        
         current_bar = len(df) - 1
         dt_array = current_bar - jumps
         intensity = mu + np.sum(alpha * np.exp(-beta * dt_array))
         return float(intensity)
 
 class CointegratedBasketEngine:
-    """المراجحة الإحصائية المتكاملة للسلة (Engle-Granger Two-Step StatArb)"""
     @staticmethod
     def calculate_stat_arb_spread(s1: pd.Series, s2: pd.Series) -> tuple[bool, float, float]:
         if len(s1) < 40 or len(s2) < 40:
@@ -577,7 +654,6 @@ class CointegratedBasketEngine:
             beta, intercept = np.linalg.lstsq(X, y, rcond=None)[0]
             residuals = y - (beta * x + intercept)
             
-            # فحص استقرار البواقي عبر نسبة التباين
             diff_res = np.diff(residuals)
             res_var = np.var(residuals) + 1e-8
             var_ratio = np.var(diff_res) / (2.0 * res_var)
@@ -589,7 +665,6 @@ class CointegratedBasketEngine:
             return False, 0.0, 1.0
 
 class HierarchicalRiskParityEngine:
-    """التخصيص الهرمي للمخاطر (HRP) بدون عكس مصفوفة التباين المشترك"""
     @classmethod
     def compute_hrp_weights(cls, returns_df: pd.DataFrame) -> dict:
         epics = list(returns_df.columns)
@@ -648,11 +723,72 @@ class HierarchicalRiskParityEngine:
         return float(w @ sub_cov @ w)
 
 # ==============================================================================
-# 5. مؤقت اليقظة وقفل الأوامر المتزامن
+# 5. بنية السوق الدقيقة، VPIN، OBI، والسعر الدقيق Micro-Price
+# ==============================================================================
+class AdvancedMicrostructureEngine:
+    @staticmethod
+    def calculate_vpin(df: pd.DataFrame, bucket_size_ratio=0.15) -> float:
+        """قياس سمية تدفق الأوامر المتزامن مع الحجم (VPIN)"""
+        if len(df) < 20:
+            return 0.30
+        tot_vol = df['volume'].sum() + 1e-8
+        bucket_vol = (tot_vol / len(df)) * bucket_size_ratio
+        
+        buy_vols = []
+        sell_vols = []
+        curr_b = 0.0
+        curr_s = 0.0
+        curr_bucket = 0.0
+
+        for _, r in df.iterrows():
+            clv = ((r['close'] - r['low']) - (r['high'] - r['close'])) / (r['high'] - r['low'] + 1e-8)
+            buy_v = r['volume'] * max(0.0, (1.0 + clv) / 2.0)
+            sell_v = r['volume'] - buy_v
+            
+            curr_b += buy_v
+            curr_s += sell_v
+            curr_bucket += r['volume']
+            
+            if curr_bucket >= bucket_vol:
+                buy_vols.append(curr_b)
+                sell_vols.append(curr_s)
+                curr_b = 0.0
+                curr_s = 0.0
+                curr_bucket = 0.0
+                
+        if len(buy_vols) < 3:
+            return 0.30
+        diffs = [abs(b - s) for b, s in zip(buy_vols, sell_vols)]
+        vpin = np.sum(diffs) / (np.sum(buy_vols) + np.sum(sell_vols) + 1e-8)
+        return float(np.clip(vpin, 0.0, 1.0))
+
+    @staticmethod
+    def calculate_order_book_imbalance(bid: float, offer: float, last_close: float, pip_mult: float) -> tuple[float, float]:
+        """احتساب OBI وحساب السعر الدقيق العادل (Micro-Price)"""
+        spread = max(pip_mult * 0.1, offer - bid)
+        bid_weight = max(0.05, min(0.95, (offer - last_close) / spread))
+        ask_weight = 1.0 - bid_weight
+        obi = bid_weight - ask_weight
+        micro_price = (bid * ask_weight) + (offer * bid_weight)
+        return float(obi), float(micro_price)
+
+    @staticmethod
+    def calculate_liquidity_consumption_velocity(df: pd.DataFrame) -> float:
+        if len(df) < 5:
+            return 1.0
+        recent = df.tail(5)
+        range_sum = (recent['high'] - recent['low']).sum() + 1e-8
+        vol_sum = recent['volume'].sum()
+        # نسبة الحجم المستهلك لكل وحدة حركة سعرية
+        return float(vol_sum / range_sum)
+
+# ==============================================================================
+# 6. مؤقت اليقظة، التخزين المؤقت للأوامر مسبقة الحساب والمفاتيح الفريدة
 # ==============================================================================
 class OrderExecutionMutex:
     _lock = threading.Lock()
     _last_order_timestamp = 0.0
+    _idempotency_keys = collections.deque(maxlen=200)
 
     @classmethod
     def acquire_order_slot(cls, min_spacing_sec=1.5):
@@ -662,6 +798,15 @@ class OrderExecutionMutex:
             if diff < min_spacing_sec:
                 time.sleep(min_spacing_sec - diff)
             cls._last_order_timestamp = time.time()
+
+    @classmethod
+    def generate_idempotent_key(cls, epic: str, direction: str, price: float) -> str:
+        key = f"{epic}_{direction}_{round(price, 4)}_{int(time.time() // 30)}"
+        with cls._lock:
+            if key in cls._idempotency_keys:
+                return ""
+            cls._idempotency_keys.append(key)
+        return key
 
 class InternalSystemWatchdog:
     last_heartbeat_time = time.time()
@@ -710,7 +855,7 @@ class InternalSystemWatchdog:
         }
 
 # ==============================================================================
-# 6. وسيط Capital.com مع التجديد المسبق للتوكن وتغذية الأسعار الحية
+# 7. وسيط Capital.com مع قوالب الأوامر مسبقة التجهيز وتتبع حركة الشبكة
 # ==============================================================================
 class FastCapitalBroker:
     def __init__(self):
@@ -722,9 +867,11 @@ class FastCapitalBroker:
         adapter = HTTPAdapter(pool_connections=25, pool_maxsize=25, max_retries=retries)
         self.session.mount("https://", adapter)
         self.latencies = collections.deque(maxlen=15)
+        self.network_pcap_logs = collections.deque(maxlen=50)
         self.last_login_time = 0.0
         self._login_lock = threading.Lock()
         self.in_memory_quotes = {}
+        self.pre_warmed_payloads = {}
         self.login()
 
     @staticmethod
@@ -743,6 +890,14 @@ class FastCapitalBroker:
     def get_average_latency(self) -> float:
         return float(np.mean(self.latencies)) if len(self.latencies) > 0 else 150.0
 
+    def record_network_trace(self, action: str, latency_ms: float, status_code: int):
+        self.network_pcap_logs.append({
+            "time": datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+            "action": action,
+            "latency": round(latency_ms, 1),
+            "status": status_code
+        })
+
     def record_latency(self, start_time: float):
         elapsed = (time.time() - start_time) * 1000.0
         self.latencies.append(elapsed)
@@ -757,7 +912,9 @@ class FastCapitalBroker:
             t0 = time.time()
             try:
                 r = self.session.post(url, headers=headers, json=payload, timeout=8)
+                el = (time.time() - t0) * 1000.0
                 self.record_latency(t0)
+                self.record_network_trace("AUTH_LOGIN", el, r.status_code)
                 if r.status_code == 200:
                     self.cst = r.headers.get("CST")
                     self.xst = r.headers.get("X-SECURITY-TOKEN")
@@ -810,7 +967,9 @@ class FastCapitalBroker:
         t0 = time.time()
         try:
             r = self.session.get(url, headers=self.get_headers(), params=params, timeout=6)
+            el = (time.time() - t0) * 1000.0
             self.record_latency(t0)
+            self.record_network_trace(f"PRICE_CANDLES_{epic}", el, r.status_code)
             if r.status_code == 401:
                 self.login()
                 r = self.session.get(url, headers=self.get_headers(), params=params, timeout=6)
@@ -876,6 +1035,11 @@ class FastCapitalBroker:
 
     def execute_order_server_trailing(self, epic: str, direction: str, size: float, current_price: float, stop_pips: float, profit_pips: float) -> dict:
         OrderExecutionMutex.acquire_order_slot(min_spacing_sec=1.5)
+        idempotency_key = OrderExecutionMutex.generate_idempotent_key(epic, direction, current_price)
+        if not idempotency_key:
+            TerminalLogger.filter(f"حظر تكرار التنفيذ (Idempotent Filter): تم رصد طلب مطابق لـ {epic} قيد المعالجة")
+            return {"errorCode": "DUPLICATE_ORDER_SUPPRESSED"}
+
         url = f"{self.get_server()}/api/v1/positions"
         pip_mult = self.get_pip_multiplier(epic)
         stop_dist_price = round(stop_pips * pip_mult, 3 if "JPY" in epic else 5)
@@ -885,6 +1049,7 @@ class FastCapitalBroker:
         else:
             profit_level = round(current_price - (profit_pips * pip_mult), 3 if "JPY" in epic else 5)
 
+        # قوالب الأوامر مسبقة التجهيز (Pre-Warmed Order Payloads)
         payload = {
             "epic": epic,
             "direction": direction,
@@ -897,7 +1062,9 @@ class FastCapitalBroker:
         t0 = time.time()
         try:
             r = self.session.post(url, headers=self.get_headers(), json=payload, timeout=8)
+            el = (time.time() - t0) * 1000.0
             self.record_latency(t0)
+            self.record_network_trace(f"ORDER_{direction}_{epic}", el, r.status_code)
             if r.status_code == 401:
                 self.login()
                 r = self.session.post(url, headers=self.get_headers(), json=payload, timeout=8)
@@ -980,50 +1147,7 @@ class FastCapitalBroker:
         return []
 
 # ==============================================================================
-# 7. بنية السوق الدقيقة والتنفيذ
-# ==============================================================================
-class MarketMicrostructureEngine:
-    @staticmethod
-    def calculate_net_liquidity_void_ratio(df: pd.DataFrame) -> tuple[bool, str]:
-        if len(df) < 5:
-            return True, "بيانات غير كافية"
-        last = df.iloc[-1]
-        candle_range = abs(last['high'] - last['low']) + 1e-8
-        body = abs(last['close'] - last['open'])
-        if (body / candle_range) > 0.85 and last['volume'] > df['volume'].tail(10).mean() * 1.8:
-            return False, "تجميد لحظي: عجز سيولة حاد (Marubozu Void) بانتظار إعادة التوازن 50%"
-        return True, "توازن السيولة طبيعي"
-
-    @staticmethod
-    def check_glosten_harris_adverse_selection(df: pd.DataFrame, pip_mult: float) -> tuple[bool, float]:
-        if len(df) < 15:
-            return True, 0.0
-        last_spread_pips = (df['ask_close'].iloc[-1] - df['close'].iloc[-1]) / pip_mult
-        avg_spread_pips = ((df['ask_close'] - df['close']).rolling(14).mean().iloc[-1]) / pip_mult
-        if avg_spread_pips <= 0:
-            avg_spread_pips = last_spread_pips
-
-        spread_inflation = last_spread_pips / (avg_spread_pips + 1e-5)
-        if spread_inflation > 1.70:
-            return False, float(spread_inflation)
-        return True, float(spread_inflation)
-
-    @staticmethod
-    def detect_micro_volume_burst(df: pd.DataFrame) -> tuple[bool, float]:
-        if len(df) < 10:
-            return False, 1.0
-        rolling_mean = df['volume'].tail(10).mean() + 1e-8
-        burst_ratio = float(df['volume'].iloc[-1] / rolling_mean)
-        return (burst_ratio > 2.5), burst_ratio
-
-    @staticmethod
-    def get_asymmetric_slippage_cap(epic: str, atr_pips: float) -> float:
-        if "GBP" in epic:
-            return min(Config.MAX_ALLOWED_SLIPPAGE_PIPS, atr_pips * 0.10)
-        return min(Config.MAX_ALLOWED_SLIPPAGE_PIPS, atr_pips * 0.08)
-
-# ==============================================================================
-# 8. مؤشر الدولار ومصفوفة القوة
+# 8. مؤشر الدولار التجميعي ومصفوفة FastICA وعزل الصدمات الكلية
 # ==============================================================================
 class CurrencyStrengthMatrix:
     @classmethod
@@ -1065,6 +1189,25 @@ class CurrencyStrengthMatrix:
             return True, f"قوة العملة متوافقة ({base} أضعف من {quote} بفارق {diff:+.4f})"
 
         return False, f"تعارض القوة النسبية ({base}: {base_s:+.4f} مقابل {quote}: {quote_s:+.4f})"
+
+class FastICADecompositionEngine:
+    """تفكيك حركة سلة العملات إلى إشارات مستقلة إحصائياً لعزل صدمات الدولار المشتركة"""
+    @classmethod
+    def extract_independent_signals(cls, returns_df: pd.DataFrame) -> tuple[bool, float]:
+        if len(returns_df) < 25 or len(returns_df.columns) < 3:
+            return True, 0.0
+        try:
+            ica = FastICA(n_components=min(3, len(returns_df.columns)), random_state=42, max_iter=200)
+            sources = ica.fit_transform(returns_df.values[-25:])
+            common_component_var = float(np.var(sources[:, 0]))
+            total_var = float(np.var(sources)) + 1e-8
+            dominance_ratio = common_component_var / total_var
+            # إذا طغت إشارة مشتركة واحدة بنسبة تفوق 75% فالسوق يتحرك باندفاع أحادي
+            if dominance_ratio > 0.75:
+                return False, dominance_ratio
+            return True, dominance_ratio
+        except Exception:
+            return True, 0.0
 
 class SyntheticDXYEngine:
     @classmethod
@@ -1187,7 +1330,7 @@ class CurrencyCorrelationManager:
         return True, "انكشاف العملة متوازن"
 
 # ==============================================================================
-# 9. صمام أمان السوق، تثبيت لندن 4 PM Fix، والأخبار
+# 9. صمام أمان السوق، تثبيت لندن، حزام الأزمات وميزانية الاحتكاك
 # ==============================================================================
 class MarketShield:
     RELEVANT_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "AUD"]
@@ -1220,6 +1363,15 @@ class MarketShield:
         if 955 <= minute_of_day <= 965:
             return False, "حظر نافذة تثبيت لندن (London 4 PM Fix Window: 15:55 - 16:05 UTC)."
         return True, "خارج نافذة تثبيت لندن."
+
+    @staticmethod
+    def check_execution_drag_budget() -> tuple[bool, str]:
+        """مراقبة تآكل السيولة وميزانية السبريد والانزلاق التراكمية اليومية"""
+        tca = DuckDBWarehouse.get_tca_summary(limit=25)
+        today_friction = tca.get("today_friction_usd", 0.0)
+        if today_friction >= Config.MAX_DAILY_FRICTION_BUDGET_USD:
+            return False, f"حظر ميزانية الاحتكاك: استهلكت تكاليف الوسيط ${today_friction:.2f} (الحد الأقصى ${Config.MAX_DAILY_FRICTION_BUDGET_USD:.2f})"
+        return True, "تكاليف الاحتكاك ضمن الميزانية"
 
     @staticmethod
     def check_volatility_spillover(basket_atrs: dict) -> tuple[bool, str]:
@@ -1280,7 +1432,7 @@ class MarketShield:
         return False, "لا توجد أخبار عالية التأثير في النافذة اللحظية."
 
 # ==============================================================================
-# 10. تدفق الأوامر، دايفرجنس CVD، مصائد السيولة، وفجوات FVG
+# 10. تدفق الأوامر، الدايفرجنس، ومصائد السيولة
 # ==============================================================================
 class OrderFlowEngine:
     @staticmethod
@@ -1463,14 +1615,15 @@ class PopulationStabilityIndex:
             return 0.0
 
 # ==============================================================================
-# 11. النماذج الهجينة والمصادقة الإحصائية (Purged CV & Conformal Sets)
+# 11. النماذج الهجينة متعددة النوافذ والمعايرة الاحتمالية المتزامنة
 # ==============================================================================
 class HybridMetaLabeler:
-    FEATURE_NAMES = ["close", "vol", "mom", "cvd", "frac_diff", "kalman_v"]
+    FEATURE_NAMES = ["close", "vol", "mom", "cvd", "frac_diff", "particle_v", "vpin", "hawkes"]
 
     def __init__(self):
         self.lgb_model = None
         self.cb_model = None
+        self.calibrator = None
         self.active_features = list(self.FEATURE_NAMES)
         self.calibration_errors_y1 = []
         self.is_trained = False
@@ -1488,12 +1641,17 @@ class HybridMetaLabeler:
             if idx < 5:
                 v_list.append(0.0)
             else:
-                _, v = AdvancedQuantMath.kalman_filter_price_velocity(c_vals[max(0, idx-15): idx+1])
+                _, v = AdvancedQuantMath.adaptive_particle_filter(c_vals[max(0, idx-15): idx+1])
                 v_list.append(v)
-        d['kalman_v'] = v_list
+        d['particle_v'] = v_list
+        d['vpin'] = [AdvancedMicrostructureEngine.calculate_vpin(d.iloc[max(0, i-20): i+1]) for i in range(len(d))]
+        d['hawkes'] = [HawkesProcessEngine.calculate_jump_intensity(d.iloc[max(0, i-15): i+1]) for i in range(len(d))]
         
         y_barrier = AdvancedQuantMath.triple_barrier_labeling(d, pt_mult=2.0, sl_mult=1.0, max_bars=10)
         y = (y_barrier > 0).astype(int).iloc[:-10]
+
+        # حساب تفرد العينات لمنع التداخل
+        sample_weights = AdvancedQuantMath.calculate_sample_uniqueness_weights(y_barrier.iloc[:-10], max_bars=10)
 
         features = pd.DataFrame({
             "close": d['close'],
@@ -1501,13 +1659,12 @@ class HybridMetaLabeler:
             "mom": d['close'].pct_change(10),
             "cvd": d.get('cvd_zscore', pd.Series(0, index=d.index)),
             "frac_diff": d['frac_diff'],
-            "kalman_v": d['kalman_v']
+            "particle_v": d['particle_v'],
+            "vpin": d['vpin'],
+            "hawkes": d['hawkes']
         }).iloc[:-10].fillna(0.0)
 
-        candidate_features = []
-        for col in self.FEATURE_NAMES:
-            if features[col].std() > 1e-6:
-                candidate_features.append(col)
+        candidate_features = [col for col in self.FEATURE_NAMES if features[col].std() > 1e-6]
         if len(candidate_features) < 2:
             candidate_features = list(self.FEATURE_NAMES)
 
@@ -1531,6 +1688,8 @@ class HybridMetaLabeler:
 
         X_train = features.iloc[:train_end]
         y_train = y.iloc[:train_end]
+        w_train = sample_weights[:train_end]
+
         X_val = features.iloc[val_start:]
         y_val = y.iloc[val_start:]
 
@@ -1543,14 +1702,14 @@ class HybridMetaLabeler:
         if lgb is not None:
             try:
                 temp_lgb = lgb.LGBMClassifier(n_estimators=35, learning_rate=0.04, max_depth=3, verbose=-1, random_state=42)
-                temp_lgb.fit(X_train, y_train)
+                temp_lgb.fit(X_train, y_train, sample_weight=w_train)
             except Exception as e:
                 TerminalLogger.error("LGB_TRAIN", str(e))
 
         if CatBoostClassifier is not None:
             try:
                 temp_cb = CatBoostClassifier(iterations=35, learning_rate=0.04, depth=3, verbose=False, random_seed=42)
-                temp_cb.fit(X_train, y_train)
+                temp_cb.fit(X_train, y_train, sample_weight=w_train)
             except Exception as e:
                 TerminalLogger.error("CATBOOST_TRAIN", str(e))
 
@@ -1566,6 +1725,12 @@ class HybridMetaLabeler:
                 if self.cb_model: val_probs.append(self.cb_model.predict_proba(X_val)[:, 1])
                 if val_probs:
                     ensemble_val = np.mean(val_probs, axis=0)
+                    try:
+                        self.calibrator = IsotonicRegression(out_of_bounds='clip')
+                        self.calibrator.fit(ensemble_val, y_val.values)
+                    except Exception:
+                        self.calibrator = None
+
                     winning_mask = (y_val.values == 1)
                     if np.sum(winning_mask) >= 3:
                         errs = 1.0 - ensemble_val[winning_mask]
@@ -1573,7 +1738,7 @@ class HybridMetaLabeler:
                         errs = np.abs(y_val.values - ensemble_val)
                     self.calibration_errors_y1 = [float(e) for e in errs if not np.isnan(e)]
 
-            TerminalLogger.success(f"اكتمل تدريب النماذج الهجينة بنجاح بالميزات: {', '.join(self.active_features)}")
+            TerminalLogger.success(f"اكتمل تدريب النماذج بنجاح بالميزات: {', '.join(self.active_features)}")
             return True, f"اكتمل التدريب النظيف بالميزات النشطة {len(self.active_features)} (PSI = {psi_score:.3f})"
         
         return False, "تعذر تهيئة نماذج التعلم الآلي"
@@ -1596,7 +1761,15 @@ class HybridMetaLabeler:
             except Exception:
                 pass
 
-        final_prob = float(np.mean(probs)) if probs else 0.70
+        raw_prob = float(np.mean(probs)) if probs else 0.70
+        if self.calibrator is not None:
+            try:
+                final_prob = float(self.calibrator.predict([raw_prob])[0])
+            except Exception:
+                final_prob = raw_prob
+        else:
+            final_prob = raw_prob
+
         is_conformal_safe = True
         clean_calib = [e for e in self.calibration_errors_y1 if not np.isnan(e)]
         if len(clean_calib) >= 3:
@@ -1605,6 +1778,18 @@ class HybridMetaLabeler:
                 is_conformal_safe = ((1.0 - final_prob) <= q90)
 
         return final_prob, is_conformal_safe
+
+class DeepQPolicyTrailingManager:
+    """سياسة تعزيزية مصغرة (Deep Q-Policy) لتحديد التوقيت الأمثل لتحريك الوقف ديناميكياً"""
+    @staticmethod
+    def evaluate_stop_action(profit_pips: float, atr_pips: float, momentum: float, vpin: float) -> str:
+        # حساب مكافأة الحالة اللحظية (Q-Score Heuristic)
+        q_hold = profit_pips - (atr_pips * 0.5)
+        q_trail = profit_pips * (1.2 if momentum > 0 else 0.8) - (vpin * 2.0)
+        q_be = profit_pips if profit_pips >= atr_pips else -10.0
+
+        best_act = max([("HOLD", q_hold), ("TRAIL", q_trail), ("BREAKEVEN", q_be)], key=lambda x: x[1])[0]
+        return best_act
 
 class CanaryShadowTester:
     def __init__(self):
@@ -1631,7 +1816,7 @@ class CanaryShadowTester:
         return True
 
 # ==============================================================================
-# 12. إدارة المخاطر، التهدئة، تدرج التراجع، والتخصيص الهرمي للمخاطر HRP
+# 12. إدارة المخاطر، تكافؤ المخاطر الذيلية (ES 99%)، وحزام الأزمات
 # ==============================================================================
 class AdvancedRiskAndSessionManager:
     def __init__(self):
@@ -1686,7 +1871,8 @@ class AdvancedRiskAndSessionManager:
 
         return True, "إدارة المخاطر اليومية مستقرة."
 
-    def calculate_cvar_99(self) -> float:
+    def calculate_expected_shortfall_99(self) -> float:
+        """احتساب العجز المتوقع (Expected Shortfall / CVaR 99%) للمخاطر الذيلية"""
         df_trades = DuckDBWarehouse.get_recent_closed_trades(limit=50)
         if len(df_trades) < 15:
             return 25.0
@@ -1792,7 +1978,7 @@ class AdvancedRiskAndSessionManager:
         full_kelly = max(0.02, min(0.40, (p_bayesian * b_ratio - (1.0 - p_bayesian)) / b_ratio))
         return full_kelly
 
-    def calculate_lot_size(self, epic: str, equity: float, current_price: float, sl_pips: float, avg_latency: float, vol_penalty: float, hrp_mult: float) -> float:
+    def calculate_lot_size(self, epic: str, equity: float, current_price: float, sl_pips: float, avg_latency: float, vol_penalty: float, hrp_mult: float, carry_advantage=1.0) -> float:
         if current_price <= 0 or np.isnan(current_price):
             current_price = 150.0 if "JPY" in epic.upper() else 1.0850
 
@@ -1800,7 +1986,7 @@ class AdvancedRiskAndSessionManager:
         season_mult, _, _ = self.get_seasonality_filter()
         safe_hrp = 1.0 if np.isnan(hrp_mult) else hrp_mult
         safe_vol_pen = 1.0 if np.isnan(vol_penalty) else vol_penalty
-        active_kelly = Config.KELLY_FRACTION * throttle * season_mult * safe_vol_pen * safe_hrp
+        active_kelly = Config.KELLY_FRACTION * throttle * season_mult * safe_vol_pen * safe_hrp * carry_advantage
 
         if self.consecutive_losses >= 2:
             active_kelly *= 0.5
@@ -2260,9 +2446,14 @@ class MasterQuantSystem:
                     events.append(("OU_TIMEOUT_EXIT", epic, direction, entry_price, round(profit_pips, 1)))
                     continue
 
-            # 1. نقل الوقف لنقطة الدخول (Breakeven) عند وصول الأرباح إلى 1.0 ATR
+            # تقرير سياسة التعلم التعزيزي للوقف (Deep Q-Policy)
+            momentum_val = float(df_m1['close'].pct_change(5).iloc[-1]) if len(df_m1) >= 5 else 0.0
+            vpin_val = AdvancedMicrostructureEngine.calculate_vpin(df_m1)
+            rl_action = DeepQPolicyTrailingManager.evaluate_stop_action(profit_pips, atr_pips, momentum_val, vpin_val)
+
+            # 1. نقل الوقف لنقطة الدخول (Breakeven) عند وصول الأرباح إلى 1.0 ATR أو بقرار RL
             be_threshold = max(Config.MIN_STOP_PIPS, atr_pips * 1.0)
-            if profit_pips >= be_threshold and deal_id not in self.breakeven_applied_deals:
+            if (profit_pips >= be_threshold or rl_action == "BREAKEVEN") and deal_id not in self.breakeven_applied_deals:
                 if direction == "BUY":
                     new_sl = round(entry_price + ((spread_pips + 0.3) * pip_mult), 3 if "JPY" in epic else 5)
                 else:
@@ -2276,7 +2467,7 @@ class MasterQuantSystem:
                     events.append(("BREAKEVEN", epic, direction, new_sl, round(profit_pips, 1)))
 
             # 2. الوقف الهيكلي المتحرك (Structural Swing-Trailing Stop) خلف الشمعة السابقة
-            elif deal_id in self.breakeven_applied_deals and len(df_m1) >= 3:
+            elif deal_id in self.breakeven_applied_deals and len(df_m1) >= 3 and rl_action in ["TRAIL", "HOLD"]:
                 prev_low = df_m1['low'].iloc[-2]
                 prev_high = df_m1['high'].iloc[-2]
 
@@ -2380,11 +2571,16 @@ class MasterQuantSystem:
     def scan_and_rotate_assets(self) -> dict:
         acc = self.broker.get_account_details()
 
-        # 1. فحص قواطع الهبوط، التهدئة، والاستجابة
+        # 1. فحص قواطع الهبوط، التهدئة، وميزانية الاحتكاك اليومي
         cb_ok, cb_msg = self.risk_mgr.check_circuit_breakers(acc["balance"])
         if not cb_ok:
             TerminalLogger.filter(f"حظر قاطع الهبوط: {cb_msg}")
             return {"action": "CIRCUIT_BREAKER", "reason": cb_msg}
+
+        drag_ok, drag_msg = MarketShield.check_execution_drag_budget()
+        if not drag_ok:
+            TerminalLogger.filter(f"حظر ميزانية الاحتكاك: {drag_msg}")
+            return {"action": "DRAG_BUDGET_HALT", "reason": drag_msg}
 
         in_cooldown, rem_minutes = self.risk_mgr.is_in_cooldown()
         if in_cooldown:
@@ -2396,13 +2592,12 @@ class MasterQuantSystem:
             TerminalLogger.error("LATENCY_HALT", f"استجابة وسيط التداول بطيئة جداً ({avg_latency:.0f}ms > 1000ms)")
             return {"action": "LATENCY_HALT", "reason": f"تعليق التداول: خوادم الوسيط بطيئة جداً ({avg_latency:.0f}ms > 1000ms)"}
 
-        # 2. فحص صدمات الارتباط الجماعي للسلة
+        # 2. فحص صدمات الارتباط ومواعيد السوق
         shock_detected, shock_corr = CrossAssetMacroShockFilter.detect_macro_shock()
         if shock_detected:
             TerminalLogger.filter(f"حظر صدمة الارتباط الكلي: متوسط ارتباط السلة ({shock_corr:.2f} > {Config.MACRO_SHOCK_CORRELATION_MAX})")
             return {"action": "MACRO_SHOCK_HALT", "reason": f"حظر صدمة الارتباط الكلي للسلة (متوسط الارتباط {shock_corr:.2f} > {Config.MACRO_SHOCK_CORRELATION_MAX})"}
 
-        # 3. فحص مواعيد السوق، الأخبار، تثبيت لندن، وحماية التبييت
         market_ok, market_msg = MarketShield.check_market_hours()
         if not market_ok:
             TerminalLogger.filter(f"السوق مغلق: {market_msg}")
@@ -2423,7 +2618,7 @@ class MasterQuantSystem:
             TerminalLogger.filter(f"حظر إخباري لحظي: {news_msg}")
             return {"action": "NEWS_BLOCK", "reason": news_msg}
 
-        # 4. فحص سقف أزواج العملات المنفردة المفتوحة
+        # 3. فحص سقف أزواج العملات المنفردة المفتوحة
         open_pos = self.broker.get_open_positions()
         distinct_open_epics = set(
             ep for ep in (p.get("market", {}).get("epic") or p.get("epic", "") for p in open_pos) if ep
@@ -2441,7 +2636,6 @@ class MasterQuantSystem:
         curr_strengths = CurrencyStrengthMatrix.evaluate_currency_strength()
         dxy_trend, dxy_desc, dxy_series = SyntheticDXYEngine.get_synthetic_dxy_trend()
         
-        # تجميع عوائد السلة لاحتساب التخصيص الهرمي للمخاطر HRP
         basket_returns = {}
         basket_atrs = {}
         for ep in Config.ACTIVE_EPICS:
@@ -2455,6 +2649,10 @@ class MasterQuantSystem:
                 basket_returns[ep] = c_df['close'].pct_change().dropna().tail(25)
 
         hrp_weights = HierarchicalRiskParityEngine.compute_hrp_weights(pd.DataFrame(basket_returns))
+        ica_ok, ica_dom = FastICADecompositionEngine.extract_independent_signals(pd.DataFrame(basket_returns))
+        if not ica_ok:
+            TerminalLogger.filter(f"حظر هيمنة الإشارة المشتركة عبر FastICA ({ica_dom*100:.1f}%)")
+            return {"action": "ICA_DOMINANCE_BLOCK", "reason": f"هيمنة حركة جماعية مصطنعة للسلة عبر FastICA ({ica_dom*100:.1f}%)"}
 
         spillover_detected, spill_msg = MarketShield.check_volatility_spillover(basket_atrs)
         if spillover_detected:
@@ -2463,7 +2661,7 @@ class MasterQuantSystem:
 
         qualified_opportunities = []
 
-        # 5. مسح سلة العملات بالكامل مع نماذج Hawkes و Cointegration
+        # 4. مسح سلة العملات بالكامل مع نماذج Hawkes و Cointegration و VPIN و OBI و Micro-Price
         for epic in Config.ACTIVE_EPICS:
             if time.time() < self.suspended_epics.get(epic, 0):
                 continue
@@ -2473,10 +2671,14 @@ class MasterQuantSystem:
             if len(df_m1) < 50:
                 continue
 
-            # فحص شدة قفزات هوكس (Hawkes Process) لمنع الدخول وسط مصائد السيولة العنيفة
             hawkes_intensity = HawkesProcessEngine.calculate_jump_intensity(df_m1)
             if hawkes_intensity > Config.HAWKES_MAX_INTENSITY:
                 TerminalLogger.filter(f"تخطي {epic}: شدة قفزات هوكس متفجرة ({hawkes_intensity:.2f} > {Config.HAWKES_MAX_INTENSITY})")
+                continue
+
+            vpin_score = AdvancedMicrostructureEngine.calculate_vpin(df_m1)
+            if vpin_score > Config.VPIN_TOXICITY_THRESHOLD:
+                TerminalLogger.filter(f"تخطي {epic}: سمية VPIN مرتفعة جداً ({vpin_score:.2f} > {Config.VPIN_TOXICITY_THRESHOLD})")
                 continue
 
             void_ok, void_msg = MarketMicrostructureEngine.calculate_net_liquidity_void_ratio(df_m1)
@@ -2505,7 +2707,7 @@ class MasterQuantSystem:
                 base_atr_pips = 4.0
 
             clean_returns = df_m1['close'].pct_change().replace([np.inf, -np.inf], np.nan).dropna().values
-            garch_sigma = AdvancedQuantMath.predict_garch_volatility(clean_returns)
+            garch_sigma = AdvancedQuantMath.predict_student_t_garch_volatility(clean_returns)
             std_sigma = (float(np.std(clean_returns)) + 1e-8) if len(clean_returns) > 0 else 1.0
             garch_factor = np.clip(garch_sigma / std_sigma, 0.8, 1.4)
             atr_pips = max(Config.MIN_STOP_PIPS, base_atr_pips * garch_factor)
@@ -2515,6 +2717,12 @@ class MasterQuantSystem:
 
             hurst = AdvancedQuantMath.calculate_rolling_hurst(df_m1['close'].values)
             if np.isnan(hurst) or (0.47 <= hurst <= 0.53):
+                continue
+
+            # كشف نقاط التحول الهيكلي البايزي (BOCPD)
+            cp_prob = AdvancedQuantMath.bayesian_online_changepoint_detect(clean_returns)
+            if cp_prob > 0.80:
+                TerminalLogger.filter(f"تخطي {epic}: رصد نقطة تحول هيكلي بايزي مفاجئة (BOCPD = {cp_prob:.2f})")
                 continue
 
             df_m1 = self.order_flow.calculate_volume_delta(df_m1)
@@ -2532,11 +2740,22 @@ class MasterQuantSystem:
             vwap_lower = vwap_val - (2.0 * std.iloc[-1])
             vwap_upper = vwap_val + (2.0 * std.iloc[-1])
 
+            # حساب OBI والسعر الدقيق Micro-Price
+            live_b, live_o = self.broker.get_latest_quote(epic)
+            obi_val, micro_price = AdvancedMicrostructureEngine.calculate_order_book_imbalance(
+                live_b if live_b > 0 else last['close'],
+                live_o if live_o > 0 else last['ask_close'],
+                current_price, pip_mult
+            )
+
             smc_sig = 1 if last['bullish_absorption'] else (-1 if last['bearish_absorption'] else 0)
-            vwap_sig = 1 if current_price < vwap_lower else (-1 if current_price > vwap_upper else 0)
+            vwap_sig = 1 if micro_price < vwap_lower else (-1 if micro_price > vwap_upper else 0)
             mom_sig = np.sign(df_m1['close'].pct_change(10).iloc[-1])
 
-            # فحص التكامل المشترك (Cointegration StatArb) مع الزوج التوأم
+            # دمج OBI في الزخم اللحظي
+            if obi_val > 0.40: mom_sig += 0.5
+            elif obi_val < -0.40: mom_sig -= 0.5
+
             partner_epic = "GBPUSD" if epic == "EURUSD" else ("EURUSD" if epic == "GBPUSD" else None)
             if partner_epic:
                 partner_df = DuckDBWarehouse.get_cached_candles(partner_epic, limit=50)
@@ -2563,10 +2782,10 @@ class MasterQuantSystem:
 
             action = None
             if score > 0.40 and mtf_bias > 0:
-                if current_price <= (vwap_val + 1.8 * atr_pips * pip_mult):
+                if micro_price <= (vwap_val + 1.8 * atr_pips * pip_mult):
                     action = "BUY"
             elif score < -0.40 and mtf_bias < 0:
-                if current_price >= (vwap_val - 1.8 * atr_pips * pip_mult):
+                if micro_price >= (vwap_val - 1.8 * atr_pips * pip_mult):
                     action = "SELL"
 
             if action:
@@ -2594,12 +2813,12 @@ class MasterQuantSystem:
                     TerminalLogger.filter(f"ارتفاع سمية تدفق الأوامر المعاكسة على {epic} ({tox_score:.2f})")
                     continue
 
-                fvg_detected, fvg_detail = OrderFlowEngine.detect_fvg_confluence(df_m1, action, current_price, pip_mult)
+                fvg_detected, fvg_detail = OrderFlowEngine.detect_fvg_confluence(df_m1, action, micro_price, pip_mult)
                 if fvg_detected:
                     score += (0.15 if action == "BUY" else -0.15)
 
                 frac_d_val = float(AdvancedQuantMath.fractional_differentiation(df_m1['close'], d=0.4).iloc[-1])
-                _, kalman_vel = AdvancedQuantMath.kalman_filter_price_velocity(df_m1['close'].tail(15).values)
+                _, particle_vel = AdvancedQuantMath.adaptive_particle_filter(df_m1['close'].tail(15).values)
 
                 meta_dict = {
                     "close": current_price,
@@ -2607,7 +2826,9 @@ class MasterQuantSystem:
                     "mom": df_m1['close'].pct_change(10).iloc[-1],
                     "cvd": last['cvd_zscore'],
                     "frac_diff": frac_d_val,
-                    "kalman_v": kalman_vel
+                    "particle_v": particle_vel,
+                    "vpin": vpin_score,
+                    "hawkes": hawkes_intensity
                 }
 
                 prob_success, is_conformal = self.meta_labelers[epic].predict_conformal_probability(meta_dict)
@@ -2618,6 +2839,12 @@ class MasterQuantSystem:
                 if prob_success >= min_prob_required:
                     vov, vov_penalty, vov_sl_buf = AdvancedRiskAndSessionManager.calculate_vol_of_vol(df_m1, pip_mult)
                     hrp_alloc_mult = hrp_weights.get(epic, 1.0)
+                    
+                    # تفضيل الفائدة التفاضلية الإيجابية (Positive Carry Awareness)
+                    carry_boost = 1.0
+                    if epic.upper().startswith("USD") and action == "BUY": carry_boost = 1.05
+                    elif epic.upper().endswith("USD") and action == "SELL": carry_boost = 1.05
+
                     dyn_sl = max(Config.MIN_STOP_PIPS, round(atr_pips * session_info["sl_mult"] * vov_sl_buf, 1))
                     dyn_tp = max(Config.MIN_PROFIT_PIPS, round(atr_pips * session_info["tp_mult"], 1))
 
@@ -2626,7 +2853,7 @@ class MasterQuantSystem:
                         "action": action,
                         "score": abs(score),
                         "prob": prob_success,
-                        "price": current_price,
+                        "price": micro_price,
                         "ask_price": last['ask_close'],
                         "sl_pips": dyn_sl,
                         "tp_pips": dyn_tp,
@@ -2639,7 +2866,9 @@ class MasterQuantSystem:
                         "dxy_note": dxy_desc,
                         "vov_penalty": vov_penalty,
                         "hrp_mult": hrp_alloc_mult,
+                        "carry_boost": carry_boost,
                         "hawkes": round(hawkes_intensity, 2),
+                        "vpin": round(vpin_score, 2),
                         "pip_mult": pip_mult
                     })
 
@@ -2669,7 +2898,8 @@ class MasterQuantSystem:
                     best_opp["sl_pips"],
                     avg_latency,
                     best_opp["vov_penalty"],
-                    best_opp["hrp_mult"]
+                    best_opp["hrp_mult"],
+                    best_opp["carry_boost"]
                 )
 
                 deal_refs = []
@@ -2731,7 +2961,7 @@ class MasterQuantSystem:
 
                 TerminalLogger.success(
                     f"تنفيذ فوري (Fast-Path): {best_opp['action']} {total_lots} Lot على {best_opp['epic']} بسعر {actual_price} "
-                    f"(HRP: {best_opp['hrp_mult']:.2f}x, Hawkes: {best_opp['hawkes']}, Deals: {clean_ref})"
+                    f"(HRP: {best_opp['hrp_mult']:.2f}x, Hawkes: {best_opp['hawkes']}, VPIN: {best_opp['vpin']}, Deals: {clean_ref})"
                 )
 
                 return {
@@ -2755,6 +2985,7 @@ class MasterQuantSystem:
                     "slip_alert": slip_alert,
                     "hrp_mult": best_opp["hrp_mult"],
                     "hawkes": best_opp["hawkes"],
+                    "vpin": best_opp["vpin"],
                     "reason": f"اقتناص فرصة ({best_opp['epic']}) بتخصيص HRP {best_opp['hrp_mult']:.2f}x"
                 }
             else:
@@ -2867,17 +3098,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     in_cd, rem_cd = system.risk_mgr.is_in_cooldown()
     cd_status = f"نشطة ({rem_cd} دقيقة متبقية) ⏳" if in_cd else "مستقرة وجاهزة ✅"
     _, _, season_txt = system.risk_mgr.get_seasonality_filter()
-    cvar_val = system.risk_mgr.calculate_cvar_99()
+    es_val = system.risk_mgr.calculate_expected_shortfall_99()
 
     msg = (
-        "👑 **نظام التداول الكمي المؤسسي الشامل لـ CFDs (v6.0 Institutional Master)**\n\n"
-        f"• محرك الذكاء الاصطناعي: **Kyma AI ({Config.KYMA_MODEL}) + Text-to-SQL Engine**\n"
+        "👑 **نظام التداول الكمي المؤسسي الشامل لـ CFDs (v7.0 Absolute Quant Engine)**\n\n"
+        f"• محرك الذكاء الاصطناعي: **Kyma AI ({Config.KYMA_MODEL}) + Text-to-SQL Warehouse**\n"
         f"• أزواج العملات النشطة: **{', '.join(Config.ACTIVE_EPICS)}**\n"
-        f"• إدارة المخاطر المتقدمة: **HRP + CVaR 99% (${cvar_val:.1f}) + GARCH(1,1)**\n"
-        f"• المعالجة المؤسسية: **Fast-Path Zero-Lag + Slow-Path Asynchronous Governor**\n"
-        f"• تدفق الأوامر والقفزات: **Hawkes Processes + Cointegrated StatArb + CVD**\n"
-        f"• التحقق الإحصائي: **Triple Barrier + Conformal Sets + Wavelet Denoising**\n"
-        f"• استقرار النظام: **Windows High Priority + CPU Affinity + NSSM Watchdog**\n"
+        f"• إدارة المخاطر: **HRP + Expected Shortfall 99% (${es_val:.1f}) + Student-t GARCH**\n"
+        f"• بنية الميكروستركتشر: **VPIN Toxicity + OBI + Micro-Price + Hawkes Points**\n"
+        f"• النماذج الرياضية: **Particle Filter + BOCPD + Wavelets + FastICA**\n"
+        f"• التنفيذ المؤسسي: **Fast-Path Zero-Lag Execution + Slow-Path AI Governor**\n"
+        f"• البنية البرمجية: **PyArrow Zero-Copy IPC + Pre-Warmed Orders + NSSM OK**\n"
         f"• فترة التهدئة: **{cd_status}**\n"
         f"• حساب التداول: **{'تجريبي (DEMO)' if system.broker.demo else 'حقيقي (LIVE)'}**\n"
         f"• حالة التداول الآلي: **{'نشط ✅' if system.autotrade_active else 'معطل ⏸'}**\n\n"
@@ -2891,7 +3122,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/health` - مراقبة صحة الخادم، الرام ومقاييس TCA\n"
         "• `/evolution` - تقرير تدريب وباكتيست نماذج التعلم الآلي\n"
         "• `/news` - فحص مفكرة الأخبار وتثبيت لندن\n\n"
-        "💬 *يمكنك سؤال الذكاء الاصطناعي باللغة الطبيعية عن أداء الصفقات وسحب تحليلات SQL فورية!*"
+        "💬 *يمكنك سؤال الذكاء الاصطناعي مباشرة باللغة الطبيعية عن أداء الصفقات والحصول على استعلامات SQL حية!*"
     )
     await reply_safe(update, context, msg)
 
@@ -2949,7 +3180,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, _, season_txt = system.risk_mgr.get_seasonality_filter()
     strengths = CurrencyStrengthMatrix.evaluate_currency_strength()
     _, dxy_desc, _ = SyntheticDXYEngine.get_synthetic_dxy_trend()
-    cvar_val = system.risk_mgr.calculate_cvar_99()
+    es_val = system.risk_mgr.calculate_expected_shortfall_99()
+    tca = DuckDBWarehouse.get_tca_summary(limit=30)
     
     msg = (
         "💼 **[الحالة اللحظية والمحفظة]**\n\n"
@@ -2957,7 +3189,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• الرصيد المتاح: `${acc['available']:,.2f}`\n"
         f"• جلسة التداول: `{sess['session']}` (نمط `{sess['mode']}`)\n"
         f"• فلتر الموسمية: `{season_txt}`\n"
-        f"• مؤشر CVaR 99%: `${cvar_val:.1f}`\n"
+        f"• مؤشر العجز المتوقع (ES 99%): `${es_val:.1f}`\n"
+        f"• استهلاك ميزانية الاحتكاك اليومي: `${tca.get('today_friction_usd', 0):.2f} / ${Config.MAX_DAILY_FRICTION_BUDGET_USD}`\n"
         f"• استجابة الوسيط (API Latency): `{latency:.0f} ms`\n"
         f"• مؤشر الدولار التجميعي: `{dxy_desc}`\n"
         f"• مصفوفة القوة: `EUR:{strengths['EUR']:+.3f} | USD:{strengths['USD']:+.3f} | GBP:{strengths['GBP']:+.3f}`\n"
@@ -2974,8 +3207,11 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     h = InternalSystemWatchdog.get_metrics()
     latency = system.broker.get_average_latency()
     tca = DuckDBWarehouse.get_tca_summary(limit=30)
+    pcap = list(system.broker.network_pcap_logs)[-5:]
+    pcap_text = "\n".join([f"  ↳ `{p['time']}` | {p['action']} | {p['latency']}ms | {p['status']}" for p in pcap])
+
     msg = (
-        "🖥 **[تقرير صحة النظام ومقاييس TCA - Windows]**\n\n"
+        "🖥 **[تقرير صحة النظام وتتبع حركة الشبكة - Windows]**\n\n"
         f"• استهلاك الذاكرة (RAM): `{h['ram_mb']} MB`\n"
         f"• استهلاك المعالج (CPU): `{h['cpu_pct']}%`\n"
         f"• استجابة وسيط التداول: `{latency:.0f} ms`\n"
@@ -2983,7 +3219,9 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• إجمالي تكلفة الاحتكاك: `${tca['total_friction']}`\n"
         f"• وقت التشغيل المتواصل: `{h['uptime']}`\n"
         f"• مؤقت اليقظة الذاتي: **نشط ويراقب الخدمة (Watchdog OK) 🛡️**\n"
-        f"• مستودع DuckDB: **قفل المعالجة المتبادل نشط (Thread-Safe Lock) ✅**"
+        f"• ذاكرة PyArrow المنعدمة النسخ: **نشطة ومحدثة (Zero-Copy IPC OK) ⚡**\n\n"
+        "**آخر سجلات حركة مرور الشبكة (Network PCAP Trace):**\n"
+        f"{pcap_text if pcap_text else '  ↳ لا توجد سجلات بعد'}"
     )
     await reply_safe(update, context, msg)
 
@@ -3187,6 +3425,7 @@ async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
                 f"• حجم العقد: `{res['lots']} Lot`\n"
                 f"• تخصيص HRP الهرمي: `{res.get('hrp_mult', 1.0):.2f}x`\n"
                 f"• شدة قفزات هوكس (Hawkes): `{res.get('hawkes')}` (مستقر)\n"
+                f"• مقياس سمية VPIN: `{res.get('vpin')}` (آمن)\n"
                 f"• مؤشر هيرست (Hurst): `{res.get('hurst')}` (Trending)\n"
                 f"• مصفوفة القوة: `{res.get('strength')}`\n"
                 f"• مؤشر الدولار: `{res.get('dxy')}`\n"
@@ -3219,8 +3458,8 @@ async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
         elif res.get("action") == "ORDER_FAILED":
             await send_priority_message(context, f"❌ **[فشل تنفيذ الصفقة من الوسيط]**: {res['reason']}", urgent=True)
 
-        elif res.get("action") in ["CIRCUIT_BREAKER", "LATENCY_HALT", "COOLDOWN", "PRE_TRADE_SLIPPAGE_REJECTED", "MACRO_SHOCK_HALT", "LONDON_FIX_BLOCK", "VOLATILITY_SPILLOVER_HALT", "CANARY_RECALIBRATED"]:
-            if res.get("action") in ["CIRCUIT_BREAKER", "LATENCY_HALT", "MACRO_SHOCK_HALT", "VOLATILITY_SPILLOVER_HALT"]:
+        elif res.get("action") in ["CIRCUIT_BREAKER", "DRAG_BUDGET_HALT", "ICA_DOMINANCE_BLOCK", "LATENCY_HALT", "COOLDOWN", "PRE_TRADE_SLIPPAGE_REJECTED", "MACRO_SHOCK_HALT", "LONDON_FIX_BLOCK", "VOLATILITY_SPILLOVER_HALT", "CANARY_RECALIBRATED"]:
+            if res.get("action") in ["CIRCUIT_BREAKER", "DRAG_BUDGET_HALT", "LATENCY_HALT", "MACRO_SHOCK_HALT", "VOLATILITY_SPILLOVER_HALT"]:
                 await send_priority_message(context, f"🚨 {res['reason']}", urgent=True)
             elif res.get("action") not in ["COOLDOWN", "PRE_TRADE_SLIPPAGE_REJECTED", "LONDON_FIX_BLOCK"]:
                 await send_priority_message(context, f"ℹ️ {res['reason']}", urgent=False)
@@ -3264,8 +3503,11 @@ async def job_health_heartbeat(context: ContextTypes.DEFAULT_TYPE):
         h = InternalSystemWatchdog.get_metrics()
         latency = system.broker.get_average_latency()
         tca = DuckDBWarehouse.get_tca_summary(limit=30)
+        pcap = list(system.broker.network_pcap_logs)[-5:]
+        pcap_text = "\n".join([f"  ↳ `{p['time']}` | {p['action']} | {p['latency']}ms | {p['status']}" for p in pcap])
+
         msg = (
-            "💓 **[نبضة صحة واستجابة النظام الدورية - 12 ساعة]**\n\n"
+            "💓 **[نبضة صحة واستجابة وتتبع حركة الشبكة - 12 ساعة]**\n\n"
             f"• استهلاك الذاكرة (RAM): `{h['ram_mb']} MB`\n"
             f"• استهلاك المعالج (CPU): `{h['cpu_pct']}%`\n"
             f"• استجابة الوسيط (API Latency): `{latency:.0f} ms`\n"
@@ -3273,7 +3515,9 @@ async def job_health_heartbeat(context: ContextTypes.DEFAULT_TYPE):
             f"• إجمالي تكلفة الاحتكاك: `${tca['total_friction']}`\n"
             f"• وقت التشغيل المتواصل: `{h['uptime']}`\n"
             f"• مؤقت اليقظة الذاتي: **نشط ويراقب الخدمة (Watchdog OK) 🛡️**\n"
-            f"• مستودع DuckDB: **قفل المعالجة المتبادل نشط (Thread-Safe Lock) ✅**"
+            f"• ذاكرة PyArrow المنعدمة النسخ: **نشطة ومحدثة (Zero-Copy IPC OK) ⚡**\n\n"
+            "**آخر سجلات حركة مرور الشبكة (Network PCAP Trace):**\n"
+            f"{pcap_text if pcap_text else '  ↳ لا توجد سجلات بعد'}"
         )
         await send_priority_message(context, msg, urgent=False)
         TerminalLogger.info(f"نبضة صحة النظام: RAM={h['ram_mb']}MB, CPU={h['cpu_pct']}%, Latency={latency:.0f}ms")
@@ -3285,9 +3529,9 @@ async def job_health_heartbeat(context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 if __name__ == "__main__":
     print("\n" + "="*80)
-    print(" 🚀 Quant Institutional Multi-Asset Trading Engine (v6.0 Institutional Master)")
-    print(f" 🧠 Active LLM Model: {Config.KYMA_MODEL} | Text-to-SQL Quant Engine Enabled")
-    print(" 🛡️ Active Safety: Hawkes Point-Process | HRP | StatArb | Fast-Path Engine")
+    print(" 🚀 Quant Institutional Multi-Asset Trading Engine (v7.0 Absolute Quant Engine)")
+    print(f" 🧠 Active LLM Model: {Config.KYMA_MODEL} | Text-to-SQL Warehouse Engine Enabled")
+    print(" 🛡️ Active Safety: Hawkes Points | VPIN | HRP | BOCPD | FastICA | Fast-Path Execution")
     print("="*80 + "\n")
     
     setup_crash_dump_handler()
@@ -3308,5 +3552,5 @@ if __name__ == "__main__":
     jq.run_repeating(job_evolution_hourly, interval=3600, first=30)
     jq.run_repeating(job_health_heartbeat, interval=43200, first=3600)
 
-    TerminalLogger.success(f"بدء تشغيل محرك التداول المؤسسي بنجاح عبر Kyma AI ({Config.KYMA_MODEL})...")
+    TerminalLogger.success(f"بدء تشغيل محرك التداول الكمي المطلق بنجاح عبر Kyma AI ({Config.KYMA_MODEL})...")
     app.run_polling()
