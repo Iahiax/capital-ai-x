@@ -18,6 +18,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import numpy as np
 import pandas as pd
+from scipy.cluster.hierarchy import linkage, to_tree
+from scipy.spatial.distance import squareform
 from datetime import datetime, timezone, timedelta
 
 # تفعيل دعم ألوان ANSI في تيرمينال Windows
@@ -94,7 +96,7 @@ class TerminalLogger:
             print(f"{cls.RED}↳ تفاصيل الخطأ البرمجي:\n{tb.strip()}{cls.RESET}\n")
 
 # ==============================================================================
-# 1. إعدادات النظام وقائمة أزواج العملات
+# 1. إعدادات النظام وقائمة أزواج العملات والمعاملات الكمية
 # ==============================================================================
 class Config:
     # Capital.com API
@@ -137,6 +139,7 @@ class Config:
     VOL_OF_VOL_HIGH_THRESHOLD = 0.35   # عتبة تقلب التقلب لتخفيض الحجم وتوسيع الوقف
     MAX_TIME_UNDER_WATER_SEC = 14400   # حد مدة التراجع (4 ساعات) لتخفيض كيلي
     CANARY_FORWARD_TEST_MINUTES = 30   # مدة اختبار الظل للنماذج قبل تفعيلها
+    HAWKES_MAX_INTENSITY = 2.4         # سقف شدة قفزات هوكس لحظر الدخول وقت الصدمات
 
     # Telegram Bot
     TELEGRAM_BOT_TOKEN = "8833615675:AAE-NKK9yStPi0NAeRnbJ8p_gZLpcj_8-7E"
@@ -156,7 +159,7 @@ class Config:
     DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market_warehouse.duckdb")
 
 # ==============================================================================
-# 2. هندسة استقرار ويندوز ومعالج الانهيارات
+# 2. هندسة استقرار ويندوز ومعالج الانهيارات (Affinity & Crash Handler)
 # ==============================================================================
 def tune_windows_process_affinity_and_priority():
     try:
@@ -196,7 +199,7 @@ def setup_crash_dump_handler():
     sys.excepthook = global_excepthook
 
 # ==============================================================================
-# 3. مستودع البيانات المحلي فائق السرعة عبر DuckDB
+# 3. مستودع البيانات المحلي فائق السرعة عبر DuckDB مع دعم Text-to-SQL
 # ==============================================================================
 class DuckDBWarehouse:
     _lock = threading.RLock()
@@ -365,6 +368,28 @@ class DuckDBWarehouse:
             return 0.0, 0.0
 
     @classmethod
+    def execute_safe_query(cls, sql_query: str) -> str:
+        """محرك استعلام Text-to-SQL آمن ومحصن بنسبة 100% للقراءة فقط"""
+        clean_q = sql_query.strip()
+        prohibited = ["drop", "delete", "insert", "update", "alter", "truncate", "create", "grant"]
+        first_token = clean_q.split()[0].lower() if clean_q.split() else ""
+        
+        if first_token != "select" or any(p in clean_q.lower() for p in prohibited):
+            return "❌ خطأ أمني: الاستعلامات المسموحة محصورة في قراءة البيانات (SELECT فقط)."
+
+        with cls._lock:
+            con = duckdb.connect(Config.DB_FILE)
+            try:
+                df = con.execute(clean_q).df()
+                if df.empty:
+                    return "لا توجد نتائج مطابقة للاستعلام."
+                return df.head(15).to_markdown(index=False)
+            except Exception as e:
+                return f"خطأ في تنفيذ SQL: {e}"
+            finally:
+                con.close()
+
+    @classmethod
     def perform_maintenance(cls):
         with cls._lock:
             con = duckdb.connect(Config.DB_FILE)
@@ -378,7 +403,7 @@ class DuckDBWarehouse:
                 con.close()
 
 # ==============================================================================
-# 4. النماذج الرياضية والإحصائية المتقدمة
+# 4. النماذج الرياضية، هوكس، التكامل المشترك، والمويجات
 # ==============================================================================
 class AdvancedQuantMath:
     @staticmethod
@@ -521,6 +546,107 @@ class AdvancedQuantMath:
             labels.append(hit)
         return pd.Series(labels, index=df.index)
 
+class HawkesProcessEngine:
+    """نمذجة قفزات السيولة الذاتية واصطياد الوقف (Hawkes Point-Process)"""
+    @staticmethod
+    def calculate_jump_intensity(df: pd.DataFrame, alpha=0.85, beta=1.35, mu=0.20) -> float:
+        if len(df) < 15:
+            return 0.5
+        vols = df['volume'].values
+        vol_mean = np.mean(vols[-15:]) + 1e-8
+        jumps = np.where(vols > (vol_mean * 1.6))[0]
+        
+        if len(jumps) == 0:
+            return mu
+        
+        current_bar = len(df) - 1
+        dt_array = current_bar - jumps
+        intensity = mu + np.sum(alpha * np.exp(-beta * dt_array))
+        return float(intensity)
+
+class CointegratedBasketEngine:
+    """المراجحة الإحصائية المتكاملة للسلة (Engle-Granger Two-Step StatArb)"""
+    @staticmethod
+    def calculate_stat_arb_spread(s1: pd.Series, s2: pd.Series) -> tuple[bool, float, float]:
+        if len(s1) < 40 or len(s2) < 40:
+            return False, 0.0, 1.0
+        try:
+            x = s2.values[-40:]
+            y = s1.values[-40:]
+            X = np.column_stack([x, np.ones(len(x))])
+            beta, intercept = np.linalg.lstsq(X, y, rcond=None)[0]
+            residuals = y - (beta * x + intercept)
+            
+            # فحص استقرار البواقي عبر نسبة التباين
+            diff_res = np.diff(residuals)
+            res_var = np.var(residuals) + 1e-8
+            var_ratio = np.var(diff_res) / (2.0 * res_var)
+            
+            is_coint = 0.50 <= var_ratio <= 1.45
+            z_score = float((residuals[-1] - np.mean(residuals)) / (np.std(residuals) + 1e-8))
+            return is_coint, z_score, float(beta)
+        except Exception:
+            return False, 0.0, 1.0
+
+class HierarchicalRiskParityEngine:
+    """التخصيص الهرمي للمخاطر (HRP) بدون عكس مصفوفة التباين المشترك"""
+    @classmethod
+    def compute_hrp_weights(cls, returns_df: pd.DataFrame) -> dict:
+        epics = list(returns_df.columns)
+        if len(epics) < 2 or len(returns_df) < 15:
+            return {ep: 1.0 for ep in epics}
+        try:
+            cov = returns_df.cov()
+            corr = returns_df.corr()
+            dist = np.sqrt(np.clip(0.5 * (1.0 - corr.values), 0, 1))
+            np.fill_diagonal(dist, 0.0)
+            
+            condensed = squareform(dist)
+            link = linkage(condensed, method='single')
+            
+            def get_quasi_diag(root):
+                return [root.id] if root.is_leaf() else get_quasi_diag(root.left) + get_quasi_diag(root.right)
+            
+            tree = to_tree(link)
+            sorted_idx = get_quasi_diag(tree)
+            ordered_epics = [epics[i] for i in sorted_idx]
+            
+            weights = pd.Series(1.0, index=ordered_epics)
+            clusters = [ordered_epics]
+            
+            while len(clusters) > 0:
+                new_clusters = []
+                for cl in clusters:
+                    if len(cl) > 1:
+                        half = len(cl) // 2
+                        left = cl[:half]
+                        right = cl[half:]
+                        
+                        var_left = cls._get_cluster_var(cov, left)
+                        var_right = cls._get_cluster_var(cov, right)
+                        alpha = 1.0 - var_left / (var_left + var_right + 1e-8)
+                        
+                        weights[left] *= alpha
+                        weights[right] *= (1.0 - alpha)
+                        
+                        if len(left) > 1: new_clusters.append(left)
+                        if len(right) > 1: new_clusters.append(right)
+                clusters = new_clusters
+                
+            weights = weights / weights.sum()
+            equal_w = 1.0 / len(epics)
+            return {ep: float(weights.get(ep, equal_w) / equal_w) for ep in epics}
+        except Exception as e:
+            TerminalLogger.filter(f"تعذر حساب HRP: {e} - اعتماد التكافؤ الافتراضي")
+            return {ep: 1.0 for ep in epics}
+
+    @staticmethod
+    def _get_cluster_var(cov: pd.DataFrame, cluster: list) -> float:
+        sub_cov = cov.loc[cluster, cluster].values
+        inv_diag = 1.0 / np.maximum(np.diag(sub_cov), 1e-8)
+        w = inv_diag / np.sum(inv_diag)
+        return float(w @ sub_cov @ w)
+
 # ==============================================================================
 # 5. مؤقت اليقظة وقفل الأوامر المتزامن
 # ==============================================================================
@@ -584,7 +710,7 @@ class InternalSystemWatchdog:
         }
 
 # ==============================================================================
-# 6. وسيط Capital.com مع التجديد المسبق للتوكن
+# 6. وسيط Capital.com مع التجديد المسبق للتوكن وتغذية الأسعار الحية
 # ==============================================================================
 class FastCapitalBroker:
     def __init__(self):
@@ -598,6 +724,7 @@ class FastCapitalBroker:
         self.latencies = collections.deque(maxlen=15)
         self.last_login_time = 0.0
         self._login_lock = threading.Lock()
+        self.in_memory_quotes = {}
         self.login()
 
     @staticmethod
@@ -712,12 +839,17 @@ class FastCapitalBroker:
             df = pd.DataFrame(rows)
             if not df.empty and resolution == "MINUTE":
                 DuckDBWarehouse.upsert_candles(epic, df)
+                self.in_memory_quotes[epic] = (df['close'].iloc[-1], df['ask_close'].iloc[-1], time.time())
             return df
         except Exception as e:
             TerminalLogger.error(f"FETCH_CANDLES_{epic}", str(e))
             return pd.DataFrame()
 
     def get_latest_quote(self, epic: str) -> tuple[float, float]:
+        cached = self.in_memory_quotes.get(epic)
+        if cached and (time.time() - cached[2]) < 1.8:
+            return cached[0], cached[1]
+
         url = f"{self.get_server()}/api/v1/markets/{epic}"
         try:
             r = self.session.get(url, headers=self.get_headers(), timeout=3)
@@ -725,6 +857,8 @@ class FastCapitalBroker:
                 snap = r.json().get("snapshot", {})
                 bid = float(snap.get("bid") or 0.0)
                 offer = float(snap.get("offer") or 0.0)
+                if bid > 0 and offer > 0:
+                    self.in_memory_quotes[epic] = (bid, offer, time.time())
                 return bid, offer
         except Exception as e:
             TerminalLogger.error(f"GET_LATEST_QUOTE_{epic}", str(e))
@@ -1329,7 +1463,7 @@ class PopulationStabilityIndex:
             return 0.0
 
 # ==============================================================================
-# 11. النماذج الهجينة والمصادقة الإحصائية
+# 11. النماذج الهجينة والمصادقة الإحصائية (Purged CV & Conformal Sets)
 # ==============================================================================
 class HybridMetaLabeler:
     FEATURE_NAMES = ["close", "vol", "mom", "cvd", "frac_diff", "kalman_v"]
@@ -1497,7 +1631,7 @@ class CanaryShadowTester:
         return True
 
 # ==============================================================================
-# 12. إدارة المخاطر، التهدئة، تدرج التراجع، وتكافؤ المخاطر
+# 12. إدارة المخاطر، التهدئة، تدرج التراجع، والتخصيص الهرمي للمخاطر HRP
 # ==============================================================================
 class AdvancedRiskAndSessionManager:
     def __init__(self):
@@ -1639,19 +1773,6 @@ class AdvancedRiskAndSessionManager:
 
         return vol_of_vol, size_penalty, sl_buffer
 
-    @staticmethod
-    def calculate_risk_parity_weight(asset_atr_pips: float, basket_atrs: dict) -> float:
-        if not basket_atrs or asset_atr_pips <= 0:
-            return 1.0
-        valid_atrs = [v for v in basket_atrs.values() if not np.isnan(v) and v > 0]
-        if not valid_atrs:
-            return 1.0
-        avg_basket_atr = float(np.mean(valid_atrs))
-        parity_ratio = avg_basket_atr / asset_atr_pips
-        if np.isnan(parity_ratio):
-            return 1.0
-        return max(0.65, min(1.40, parity_ratio))
-
     def get_bayesian_rolling_kelly(self) -> float:
         df_trades = DuckDBWarehouse.get_recent_closed_trades(limit=30)
         if len(df_trades) < 10:
@@ -1671,15 +1792,15 @@ class AdvancedRiskAndSessionManager:
         full_kelly = max(0.02, min(0.40, (p_bayesian * b_ratio - (1.0 - p_bayesian)) / b_ratio))
         return full_kelly
 
-    def calculate_lot_size(self, epic: str, equity: float, current_price: float, sl_pips: float, avg_latency: float, vol_penalty: float, risk_parity_mult: float) -> float:
+    def calculate_lot_size(self, epic: str, equity: float, current_price: float, sl_pips: float, avg_latency: float, vol_penalty: float, hrp_mult: float) -> float:
         if current_price <= 0 or np.isnan(current_price):
             current_price = 150.0 if "JPY" in epic.upper() else 1.0850
 
         throttle = self.get_drawdown_throttle(equity)
         season_mult, _, _ = self.get_seasonality_filter()
-        safe_parity = 1.0 if np.isnan(risk_parity_mult) else risk_parity_mult
+        safe_hrp = 1.0 if np.isnan(hrp_mult) else hrp_mult
         safe_vol_pen = 1.0 if np.isnan(vol_penalty) else vol_penalty
-        active_kelly = Config.KELLY_FRACTION * throttle * season_mult * safe_vol_pen * safe_parity
+        active_kelly = Config.KELLY_FRACTION * throttle * season_mult * safe_vol_pen * safe_hrp
 
         if self.consecutive_losses >= 2:
             active_kelly *= 0.5
@@ -1789,107 +1910,26 @@ class MultiTimeframeAnalyzer:
             return 0, f"خطأ تجميع M15: {e}"
 
 # ==============================================================================
-# 13. المصادقة البصرية للشارت عبر Kyma Vision
-# ==============================================================================
-class KymaChartVisionValidator:
-    @staticmethod
-    def generate_chart_image_b64(df_m1: pd.DataFrame, vwap_series: pd.Series) -> str:
-        d = df_m1.tail(40).copy().reset_index(drop=True)
-        if len(d) < 10:
-            return ""
-
-        denoised_close = AdvancedQuantMath.haar_wavelet_denoise(d['close'].values)
-        v = vwap_series.tail(40).values
-
-        fig = Figure(figsize=(6, 3), dpi=100, facecolor='#0E1117')
-        canvas = FigureCanvasAgg(fig)
-        ax = fig.add_subplot(111, facecolor='#0E1117')
-
-        try:
-            for i, row in d.iterrows():
-                color = '#00FF7F' if row['close'] >= row['open'] else '#FF3B30'
-                ax.plot([i, i], [row['low'], row['high']], color=color, linewidth=1)
-                ax.plot([i, i], [row['open'], row['close']], color=color, linewidth=3)
-
-            ax.plot(range(len(denoised_close)), denoised_close, color='#FFD700', linestyle=':', linewidth=1.2, label="Denoised Trend")
-            ax.plot(range(len(v)), v, color='#00BFFF', linestyle='--', linewidth=1.5, label="VWAP")
-            ax.axis('off')
-            fig.tight_layout()
-
-            buf = io.BytesIO()
-            canvas.print_png(buf)
-            buf.seek(0)
-            img_b64 = base64.b64encode(buf.read()).decode('utf-8')
-            buf.close()
-            return img_b64
-        finally:
-            fig.clf()
-            del ax, canvas, fig
-            gc.collect()
-
-    @classmethod
-    def validate_setup_with_vision(cls, epic: str, df_m1: pd.DataFrame, vwap_series: pd.Series, action: str, price: float) -> tuple[bool, str]:
-        # بما أن نموذج Llama-3.3-70b هو نموذج نصي تداولي، يتم تخطي فحص الصور لتفادي بطء الاستجابة
-        if "llama" in Config.KYMA_MODEL.lower():
-            return True, "تمت المصادقة الإحصائية (نموذج Llama-3.3 نصي عالي الدقة)"
-
-        try:
-            b64_chart = cls.generate_chart_image_b64(df_m1, vwap_series)
-            if not b64_chart:
-                return True, "تخطي الفحص (بيانات بصرية قليلة)"
-
-            headers = {
-                "Authorization": f"Bearer {Config.KYMA_API_KEY}",
-                "Content-Type": "application/json"
-            }
-
-            prompt = (
-                f"You are a quant execution risk controller. We want to enter '{action}' on {epic} at {price}. "
-                f"Examine this 40-bar chart with VWAP and Denoised Trend. Look for hostile counter-trend wicks or fakeouts. "
-                f"Respond STRICTLY in JSON without markdown code blocks: {{\"decision\": \"APPROVE\" or \"REJECT\", \"reason\": \"brief explanation in Arabic\"}}"
-            )
-
-            payload = {
-                "model": Config.KYMA_MODEL,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{b64_chart}"}
-                            }
-                        ]
-                    }
-                ],
-                "temperature": 0.2
-            }
-
-            r = requests.post(Config.KYMA_ENDPOINT, headers=headers, json=payload, timeout=8)
-            if r.status_code == 200:
-                res_data = r.json()
-                choices = res_data.get("choices", [])
-                if choices:
-                    raw_text = choices[0].get("message", {}).get("content", "").strip()
-                    json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-                    if json_match:
-                        data = json.loads(json_match.group(0))
-                        decision = (data.get("decision") == "APPROVE")
-                        reason = data.get("reason", "موافقة بصرية")
-                        if not decision:
-                            TerminalLogger.filter(f"رفض بصري لزوج {epic}: {reason}")
-                        return decision, reason
-            else:
-                TerminalLogger.filter(f"تخطي الفحص البصري للمتابعة (رمز {r.status_code})")
-        except Exception as e:
-            TerminalLogger.filter(f"تخطي الفحص البصري: {e}")
-        return True, "تم تخطي الفحص البصري"
-
-# ==============================================================================
-# 14. محرك Kyma AI مع Function Calling المحدث بالنسق المعياري
+# 13. أدوات Kyma AI مع دعم Text-to-SQL و Function Calling
 # ==============================================================================
 KYMA_FUNCTION_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_market_warehouse",
+            "description": "استعلام SQL مباشر وقراءة سريعة لبيانات مستودع DuckDB المحلي (جداول: m1_candles, closed_trades, tca_metrics)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql_query": {
+                        "type": "string",
+                        "description": "استعلام SQL صالح يبدأ بـ SELECT فقط للتحليل الكمي والإحصائي"
+                    }
+                },
+                "required": ["sql_query"]
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -1955,10 +1995,10 @@ class KymaConversationalAgent:
         }
 
         system_instruction = f"""
-أنت المهندس الكمي والمشرف الرئيسي على نظام التداول الآلي المؤسسي الشامل لـ CFDs على فريم M1.
-أنت تتحدث باللغة العربية بطلاقة وبأسلوب مالي واثق ومحترف وموجز.
+أنت المشرف الكمي الذكي والمبرمج الرئيسي لنظام التداول الآلي المؤسسي لـ CFDs على فريم M1.
+أنت تتحدث باللغة العربية بطلاقة واحترافية وتعتمد على الأرقام الدقيقة.
 
-بيانات السوق والمحفظة اللحظية الحقيقية:
+بيانات السوق والمحفظة اللحظية:
 - الرصيد الإجمالي: ${system_context.get('balance', 0):,.2f}
 - الرصيد المتاح: ${system_context.get('available', 0):,.2f}
 - أزواج العملات النشطة: {', '.join(Config.ACTIVE_EPICS)}
@@ -1970,12 +2010,12 @@ class KymaConversationalAgent:
 - الصفقات المفتوحة: {system_context.get('open_trades', 0)}
 - التداول الآلي: {'نشط' if system_context.get('autotrade') else 'متوقف مؤقتاً'}
 - وضع الحساب: {'تجريبي (DEMO)' if system_context.get('is_demo') else 'حقيقي (LIVE)'}
-- متوسط استجابة الوسيط: {system_context.get('latency', 0):.0f}ms
+- استجابة الوسيط: {system_context.get('latency', 0):.0f}ms
 - مضاعفات ATR الحالية: الوقف={Config.ATR_SL_MULTIPLIER}x | الهدف={Config.ATR_TP_MULTIPLIER}x
 
-المهمة:
-1. إذا طلب المتداول تعديل أي إعداد، استدعِ الأداة المناسبة فوراً (Function Calling).
-2. إذا كان السؤال تحليلياً، أجب بذكاء واحترافية استناداً إلى الأرقام الحقيقية المذكورة أعلاه.
+قدراتك الخاصة:
+1. يمكنك الاستعلام المباشر عبر SQL من مستودع DuckDB باستخدام أداة `query_market_warehouse` للإجابة عن أسئلة السبريد، الصفقات السابقة، ومقاييس TCA.
+2. يمكنك تعديل إعدادات المخاطر والتبديل بين الحساب التجريبي والحقيقي وتفعيل أو إيقاف التداول عبر الأدوات فوراً.
 """
         payload = {
             "model": Config.KYMA_MODEL,
@@ -2012,13 +2052,15 @@ class KymaConversationalAgent:
                 except Exception:
                     args = {}
 
-                if func_name == "update_trading_risk":
-                    if "atr_sl_mult" in args:
-                        Config.ATR_SL_MULTIPLIER = float(args["atr_sl_mult"])
-                    if "atr_tp_mult" in args:
-                        Config.ATR_TP_MULTIPLIER = float(args["atr_tp_mult"])
-                    if "kelly_fraction" in args:
-                        Config.KELLY_FRACTION = float(args["kelly_fraction"])
+                if func_name == "query_market_warehouse":
+                    sql_q = str(args.get("sql_query", "")).strip()
+                    sql_result = DuckDBWarehouse.execute_safe_query(sql_q)
+                    return f"📊 **[نتائج استعلام مستودع DuckDB]**\n\n```sql\n{sql_q}\n```\n\n{sql_result}"
+
+                elif func_name == "update_trading_risk":
+                    if "atr_sl_mult" in args: Config.ATR_SL_MULTIPLIER = float(args["atr_sl_mult"])
+                    if "atr_tp_mult" in args: Config.ATR_TP_MULTIPLIER = float(args["atr_tp_mult"])
+                    if "kelly_fraction" in args: Config.KELLY_FRACTION = float(args["kelly_fraction"])
                     TerminalLogger.success(f"تعديل إعدادات المخاطر عبر Kyma: SL={Config.ATR_SL_MULTIPLIER}x, TP={Config.ATR_TP_MULTIPLIER}x, Kelly={Config.KELLY_FRACTION}")
                     return (
                         f"✅ **[تم تطبيق التعديل ذاتياً بواسطة Kyma AI]**\n\n"
@@ -2062,8 +2104,37 @@ class KymaConversationalAgent:
             TerminalLogger.error("KYMA_AGENT_ERROR", str(e), traceback.format_exc())
             return f"تعذر استكمال المعالجة عبر Kyma: {e}"
 
+    @classmethod
+    def async_supervise_position(cls, epic: str, action: str, price: float, bot_instance, chat_id: str):
+        """المسار البطيء الإشرافي (Slow-Path Governor) للتحليل والمراقبة في الخلفية دون تأخير التنفيذ"""
+        def _bg_task():
+            try:
+                headers = {"Authorization": f"Bearer {Config.KYMA_API_KEY}", "Content-Type": "application/json"}
+                prompt = (
+                    f"لقد تم فتح صفقة {action} على الزوج {epic} بسعر {price} عبر المسار الفوري فائق السرعة. "
+                    f"قدم نصيحة سياقية وإشرافية مختصرة جداً (سطرين) باللغة العربية حول تدفق السيولة وإدارة المخاطر اللحظية."
+                )
+                payload = {
+                    "model": Config.KYMA_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2
+                }
+                r = requests.post(Config.KYMA_ENDPOINT, headers=headers, json=payload, timeout=8)
+                if r.status_code == 200:
+                    ans = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    if ans:
+                        asyncio.run(bot_instance.send_message(
+                            chat_id=chat_id,
+                            text=f"🧠 **[إشراف الذكاء الاصطناعي - Kyma Governor]**\n{ans}",
+                            parse_mode="Markdown"
+                        ))
+            except Exception:
+                pass
+        t = threading.Thread(target=_bg_task, daemon=True)
+        t.start()
+
 # ==============================================================================
-# 15. محرك النظام الرئيسي وتدوير العملات والباكتيست الموحد
+# 14. محرك النظام الرئيسي وتدوير العملات والباكتيست الموحد
 # ==============================================================================
 class MasterQuantSystem:
     def __init__(self):
@@ -2309,7 +2380,7 @@ class MasterQuantSystem:
     def scan_and_rotate_assets(self) -> dict:
         acc = self.broker.get_account_details()
 
-        # 1. فحص قاطع الهبوط اليومي، التهدئة، ومدة التراجع
+        # 1. فحص قواطع الهبوط، التهدئة، والاستجابة
         cb_ok, cb_msg = self.risk_mgr.check_circuit_breakers(acc["balance"])
         if not cb_ok:
             TerminalLogger.filter(f"حظر قاطع الهبوط: {cb_msg}")
@@ -2320,19 +2391,18 @@ class MasterQuantSystem:
             TerminalLogger.filter(f"فترة تهدئة نشطة: باقي {rem_minutes} دقيقة")
             return {"action": "COOLDOWN", "reason": f"فترة تهدئة نشطة بعد خسارتين متتاليتين (باقي {rem_minutes} دقيقة)"}
 
-        # 2. فحص سرعة استجابة خادم الوسيط
         avg_latency = self.broker.get_average_latency()
         if avg_latency > Config.HALT_API_LATENCY_MS:
             TerminalLogger.error("LATENCY_HALT", f"استجابة وسيط التداول بطيئة جداً ({avg_latency:.0f}ms > 1000ms)")
             return {"action": "LATENCY_HALT", "reason": f"تعليق التداول: خوادم الوسيط بطيئة جداً ({avg_latency:.0f}ms > 1000ms)"}
 
-        # 3. فحص صدمات الارتباط الجماعي المفاجئ (Macro Shock)
+        # 2. فحص صدمات الارتباط الجماعي للسلة
         shock_detected, shock_corr = CrossAssetMacroShockFilter.detect_macro_shock()
         if shock_detected:
             TerminalLogger.filter(f"حظر صدمة الارتباط الكلي: متوسط ارتباط السلة ({shock_corr:.2f} > {Config.MACRO_SHOCK_CORRELATION_MAX})")
             return {"action": "MACRO_SHOCK_HALT", "reason": f"حظر صدمة الارتباط الكلي للسلة (متوسط الارتباط {shock_corr:.2f} > {Config.MACRO_SHOCK_CORRELATION_MAX})"}
 
-        # 4. فحص مواعيد السوق، الأخبار، تثبيت لندن 4PM Fix، وحماية رسوم التبييت
+        # 3. فحص مواعيد السوق، الأخبار، تثبيت لندن، وحماية التبييت
         market_ok, market_msg = MarketShield.check_market_hours()
         if not market_ok:
             TerminalLogger.filter(f"السوق مغلق: {market_msg}")
@@ -2353,7 +2423,7 @@ class MasterQuantSystem:
             TerminalLogger.filter(f"حظر إخباري لحظي: {news_msg}")
             return {"action": "NEWS_BLOCK", "reason": news_msg}
 
-        # 5. فحص سقف أزواج العملات المنفردة المفتوحة
+        # 4. فحص سقف أزواج العملات المنفردة المفتوحة
         open_pos = self.broker.get_open_positions()
         distinct_open_epics = set(
             ep for ep in (p.get("market", {}).get("epic") or p.get("epic", "") for p in open_pos) if ep
@@ -2362,7 +2432,6 @@ class MasterQuantSystem:
             TerminalLogger.filter(f"بلوغ سقف أزواج العملات المفتوحة: {len(distinct_open_epics)} / {Config.MAX_OPEN_POSITIONS}")
             return {"action": "IN_POSITION", "reason": f"تم بلوغ الحد الأقصى لأزواج العملات المتزامنة ({len(distinct_open_epics)})"}
 
-        # 6. فحص صحة نموذج الظل التجريبي (Canary Shadow Test) وإعادة التدريب الذاتي عند التراجع
         if not self.canary_tester.is_canary_healthy():
             self.train_and_evolve()
             return {"action": "CANARY_RECALIBRATED", "reason": "تمت إعادة تدريب النماذج بعد تراجع أداء نموذج الظل الاستباقي"}
@@ -2372,15 +2441,20 @@ class MasterQuantSystem:
         curr_strengths = CurrencyStrengthMatrix.evaluate_currency_strength()
         dxy_trend, dxy_desc, dxy_series = SyntheticDXYEngine.get_synthetic_dxy_trend()
         
+        # تجميع عوائد السلة لاحتساب التخصيص الهرمي للمخاطر HRP
+        basket_returns = {}
         basket_atrs = {}
         for ep in Config.ACTIVE_EPICS:
-            c_df = DuckDBWarehouse.get_cached_candles(ep, limit=20)
-            if len(c_df) >= 15:
+            c_df = DuckDBWarehouse.get_cached_candles(ep, limit=40)
+            if len(c_df) >= 20:
                 p_mult = self.broker.get_pip_multiplier(ep)
                 tr_val = np.maximum(c_df['high'] - c_df['low'], 
                                     np.maximum(abs(c_df['high'] - c_df['close'].shift(1)), 
                                                abs(c_df['low'] - c_df['close'].shift(1))))
                 basket_atrs[ep] = float((tr_val.rolling(14).mean().iloc[-1]) / p_mult)
+                basket_returns[ep] = c_df['close'].pct_change().dropna().tail(25)
+
+        hrp_weights = HierarchicalRiskParityEngine.compute_hrp_weights(pd.DataFrame(basket_returns))
 
         spillover_detected, spill_msg = MarketShield.check_volatility_spillover(basket_atrs)
         if spillover_detected:
@@ -2389,7 +2463,7 @@ class MasterQuantSystem:
 
         qualified_opportunities = []
 
-        # 7. مسح سلة العملات بالكامل
+        # 5. مسح سلة العملات بالكامل مع نماذج Hawkes و Cointegration
         for epic in Config.ACTIVE_EPICS:
             if time.time() < self.suspended_epics.get(epic, 0):
                 continue
@@ -2397,6 +2471,12 @@ class MasterQuantSystem:
             pip_mult = self.broker.get_pip_multiplier(epic)
             df_m1 = self.broker.fetch_live_candles(epic, resolution="MINUTE", max_bars=300)
             if len(df_m1) < 50:
+                continue
+
+            # فحص شدة قفزات هوكس (Hawkes Process) لمنع الدخول وسط مصائد السيولة العنيفة
+            hawkes_intensity = HawkesProcessEngine.calculate_jump_intensity(df_m1)
+            if hawkes_intensity > Config.HAWKES_MAX_INTENSITY:
+                TerminalLogger.filter(f"تخطي {epic}: شدة قفزات هوكس متفجرة ({hawkes_intensity:.2f} > {Config.HAWKES_MAX_INTENSITY})")
                 continue
 
             void_ok, void_msg = MarketMicrostructureEngine.calculate_net_liquidity_void_ratio(df_m1)
@@ -2456,22 +2536,28 @@ class MasterQuantSystem:
             vwap_sig = 1 if current_price < vwap_lower else (-1 if current_price > vwap_upper else 0)
             mom_sig = np.sign(df_m1['close'].pct_change(10).iloc[-1])
 
+            # فحص التكامل المشترك (Cointegration StatArb) مع الزوج التوأم
+            partner_epic = "GBPUSD" if epic == "EURUSD" else ("EURUSD" if epic == "GBPUSD" else None)
+            if partner_epic:
+                partner_df = DuckDBWarehouse.get_cached_candles(partner_epic, limit=50)
+                if len(partner_df) >= 40:
+                    is_coint, coint_z, _ = CointegratedBasketEngine.calculate_stat_arb_spread(df_m1['close'], partner_df['close'])
+                    if is_coint:
+                        if coint_z < -2.0: smc_sig += 1.0
+                        elif coint_z > 2.0: smc_sig -= 1.0
+
             asian_h, asian_l = DuckDBWarehouse.get_asian_range(epic)
             sweep_dir, sweep_detail = OrderFlowEngine.detect_asian_liquidity_sweep(df_m1, asian_h, asian_l, pip_mult)
-            if sweep_dir != 0:
-                smc_sig += sweep_dir * 1.5
+            if sweep_dir != 0: smc_sig += sweep_dir * 1.5
 
             eq_dir, eq_detail = OrderFlowEngine.detect_eqh_eql_sweep(df_m1, pip_mult)
-            if eq_dir != 0:
-                smc_sig += eq_dir * 1.5
+            if eq_dir != 0: smc_sig += eq_dir * 1.5
 
             cvd_dir, cvd_desc = OrderFlowEngine.detect_cvd_divergence(df_m1)
-            if cvd_dir != 0:
-                mom_sig += cvd_dir * 1.5
+            if cvd_dir != 0: mom_sig += cvd_dir * 1.5
 
             burst_hit, burst_mag = MarketMicrostructureEngine.detect_micro_volume_burst(df_m1)
-            if burst_hit:
-                mom_sig *= 1.3
+            if burst_hit: mom_sig *= 1.3
 
             score = (smc_sig * session_info["SMC"]) + (vwap_sig * session_info["VWAP"]) + (mom_sig * session_info["MOM"])
 
@@ -2531,7 +2617,7 @@ class MasterQuantSystem:
 
                 if prob_success >= min_prob_required:
                     vov, vov_penalty, vov_sl_buf = AdvancedRiskAndSessionManager.calculate_vol_of_vol(df_m1, pip_mult)
-                    risk_parity_mult = AdvancedRiskAndSessionManager.calculate_risk_parity_weight(atr_pips, basket_atrs)
+                    hrp_alloc_mult = hrp_weights.get(epic, 1.0)
                     dyn_sl = max(Config.MIN_STOP_PIPS, round(atr_pips * session_info["sl_mult"] * vov_sl_buf, 1))
                     dyn_tp = max(Config.MIN_PROFIT_PIPS, round(atr_pips * session_info["tp_mult"], 1))
 
@@ -2552,28 +2638,19 @@ class MasterQuantSystem:
                         "strength_note": strength_detail,
                         "dxy_note": dxy_desc,
                         "vov_penalty": vov_penalty,
-                        "risk_parity_mult": risk_parity_mult,
-                        "pip_mult": pip_mult,
-                        "df": df_m1,
-                        "vwap": vwap
+                        "hrp_mult": hrp_alloc_mult,
+                        "hawkes": round(hawkes_intensity, 2),
+                        "pip_mult": pip_mult
                     })
 
         if qualified_opportunities:
             best_opp = max(qualified_opportunities, key=lambda x: (x["prob"], x["score"]))
-            
-            vision_ok, vision_reason = KymaChartVisionValidator.validate_setup_with_vision(
-                best_opp["epic"], best_opp["df"], best_opp["vwap"], best_opp["action"], best_opp["price"]
-            )
-            
-            if not vision_ok:
-                TerminalLogger.filter(f"رفض بصري لزوج {best_opp['epic']}: {vision_reason}")
-                return {"action": "VISION_REJECTED", "reason": f"رفض بصري لزوج {best_opp['epic']}: {vision_reason}"}
 
+            # المسار الفوري فائق السرعة (Fast-Path Local Execution)
             if self.autotrade_active:
                 slip_cap = MarketMicrostructureEngine.get_asymmetric_slippage_cap(best_opp["epic"], best_opp["atr_pips"])
                 live_bid, live_offer = self.broker.get_latest_quote(best_opp["epic"])
                 
-                # عزل السبريد ومطابقة Ask مع Ask و Bid مع Bid بدقة
                 if best_opp["action"] == "BUY":
                     target_exec_price = live_offer if live_offer > 0 else best_opp["ask_price"]
                     drift_pips = abs(target_exec_price - best_opp["ask_price"]) / best_opp["pip_mult"]
@@ -2592,7 +2669,7 @@ class MasterQuantSystem:
                     best_opp["sl_pips"],
                     avg_latency,
                     best_opp["vov_penalty"],
-                    best_opp["risk_parity_mult"]
+                    best_opp["hrp_mult"]
                 )
 
                 deal_refs = []
@@ -2620,10 +2697,8 @@ class MasterQuantSystem:
                     )
                     res = res_1 if "dealReference" in res_1 else res_2
                     for r_c in [res_1, res_2]:
-                        if "dealReference" in r_c:
-                            deal_refs.append(str(r_c["dealReference"]))
-                        if "level" in r_c:
-                            actual_prices.append(float(r_c["level"]))
+                        if "dealReference" in r_c: deal_refs.append(str(r_c["dealReference"]))
+                        if "level" in r_c: actual_prices.append(float(r_c["level"]))
                 else:
                     res = self.broker.execute_order_server_trailing(
                         epic=best_opp["epic"],
@@ -2633,10 +2708,8 @@ class MasterQuantSystem:
                         stop_pips=best_opp["sl_pips"],
                         profit_pips=best_opp["tp_pips"]
                     )
-                    if "dealReference" in res:
-                        deal_refs.append(str(res["dealReference"]))
-                    if "level" in res:
-                        actual_prices.append(float(res["level"]))
+                    if "dealReference" in res: deal_refs.append(str(res["dealReference"]))
+                    if "level" in res: actual_prices.append(float(res["level"]))
 
                 if not deal_refs:
                     TerminalLogger.error("ORDER_REJECTED_BY_BROKER", str(res.get("errorCode", res)))
@@ -2657,8 +2730,8 @@ class MasterQuantSystem:
                 clean_ref = "-".join([re.sub(r'[^a-zA-Z0-9-]', '-', d_r) for d_r in deal_refs])
 
                 TerminalLogger.success(
-                    f"تنفيذ صفقة: {best_opp['action']} {total_lots} Lot على {best_opp['epic']} بسعر {actual_price} "
-                    f"(SL: {best_opp['sl_pips']} Pips, TP: {best_opp['tp_pips']} Pips, Deals: {clean_ref})"
+                    f"تنفيذ فوري (Fast-Path): {best_opp['action']} {total_lots} Lot على {best_opp['epic']} بسعر {actual_price} "
+                    f"(HRP: {best_opp['hrp_mult']:.2f}x, Hawkes: {best_opp['hawkes']}, Deals: {clean_ref})"
                 )
 
                 return {
@@ -2680,7 +2753,9 @@ class MasterQuantSystem:
                     "latency": round(avg_latency, 0),
                     "slippage": slippage_pips,
                     "slip_alert": slip_alert,
-                    "reason": f"اقتناص فرصة رابحة ({best_opp['epic']}) بوقف ديناميكي {best_opp['sl_pips']} نقطة"
+                    "hrp_mult": best_opp["hrp_mult"],
+                    "hawkes": best_opp["hawkes"],
+                    "reason": f"اقتناص فرصة ({best_opp['epic']}) بتخصيص HRP {best_opp['hrp_mult']:.2f}x"
                 }
             else:
                 TerminalLogger.info(f"رصد إشارة دخول في وضع المراقبة: {best_opp['action']} على {best_opp['epic']} (الاحتمالية {best_opp['prob']*100:.1f}%)")
@@ -2729,7 +2804,7 @@ class MasterQuantSystem:
         return entry
 
 # ==============================================================================
-# 16. إنشاء الكائن المشترك ومعالجات تيليجرام
+# 15. إنشاء الكائن المشترك ومعالجات تيليجرام
 # ==============================================================================
 system = MasterQuantSystem()
 
@@ -2795,18 +2870,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cvar_val = system.risk_mgr.calculate_cvar_99()
 
     msg = (
-        "👑 **نظام التداول الكمي المؤسسي الشامل لـ CFDs (M1 Institutional Quant)**\n\n"
-        f"• محرك الذكاء الاصطناعي: **Kyma AI Engine ({Config.KYMA_MODEL})**\n"
+        "👑 **نظام التداول الكمي المؤسسي الشامل لـ CFDs (v6.0 Institutional Master)**\n\n"
+        f"• محرك الذكاء الاصطناعي: **Kyma AI ({Config.KYMA_MODEL}) + Text-to-SQL Engine**\n"
         f"• أزواج العملات النشطة: **{', '.join(Config.ACTIVE_EPICS)}**\n"
-        f"• إدارة المخاطر: **Risk Parity + CVaR 99% (${cvar_val:.1f}) + GARCH(1,1)**\n"
-        f"• النماذج الرياضية: **Kalman Filter + Hurst Exp + Fractional Diff (d=0.4)**\n"
-        f"• التحقق الإحصائي: **Triple Barrier + Conformal Prediction + Wavelets**\n"
-        f"• صائد السيولة: **Judas Swing + CVD Divergence + EQH/EQL + NLVR**\n"
-        f"• حماية الأسواق: **Macro Shock + London 4PM Fix + Glosten-Harris**\n"
-        f"• انزلاق متكيف: **Asymmetric Slippage Modeling + Pre-Trade Cap**\n"
-        f"• بيئة التشغيل: **Windows High Priority + CPU Core Affinity + NSSM OK**\n"
-        f"• مراقبة حية: **Live Terminal Diagnostics Engine مفعّل 🖥️**\n"
-        f"• خيط اليقظة الداخلي: **Internal Watchdog Active (180s) 🛡️**\n"
+        f"• إدارة المخاطر المتقدمة: **HRP + CVaR 99% (${cvar_val:.1f}) + GARCH(1,1)**\n"
+        f"• المعالجة المؤسسية: **Fast-Path Zero-Lag + Slow-Path Asynchronous Governor**\n"
+        f"• تدفق الأوامر والقفزات: **Hawkes Processes + Cointegrated StatArb + CVD**\n"
+        f"• التحقق الإحصائي: **Triple Barrier + Conformal Sets + Wavelet Denoising**\n"
+        f"• استقرار النظام: **Windows High Priority + CPU Affinity + NSSM Watchdog**\n"
         f"• فترة التهدئة: **{cd_status}**\n"
         f"• حساب التداول: **{'تجريبي (DEMO)' if system.broker.demo else 'حقيقي (LIVE)'}**\n"
         f"• حالة التداول الآلي: **{'نشط ✅' if system.autotrade_active else 'معطل ⏸'}**\n\n"
@@ -2820,7 +2891,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/health` - مراقبة صحة الخادم، الرام ومقاييس TCA\n"
         "• `/evolution` - تقرير تدريب وباكتيست نماذج التعلم الآلي\n"
         "• `/news` - فحص مفكرة الأخبار وتثبيت لندن\n\n"
-        "💬 *يمكنك محادثة Kyma بالعربية أو توجيه أوامر مثل: 'عدل مضاعف وقف ATR إلى 2' أو 'أعد تدريب النماذج'!*"
+        "💬 *يمكنك سؤال الذكاء الاصطناعي باللغة الطبيعية عن أداء الصفقات وسحب تحليلات SQL فورية!*"
     )
     await reply_safe(update, context, msg)
 
@@ -3035,7 +3106,7 @@ async def kyma_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_safe(update, context, reply)
 
 # ==============================================================================
-# 17. مهام الجدولة اللحظية والساعية وتصنيف الإشعارات
+# 16. مهام الجدولة اللحظية والساعية وتصنيف الإشعارات
 # ==============================================================================
 async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -3104,31 +3175,35 @@ async def job_scanner_minute(context: ContextTypes.DEFAULT_TYPE):
             )
             await send_priority_message(context, digest_msg, urgent=False)
 
-        # مسح السوق وتدوير العملات اللحظي
+        # مسح السوق وتدوير العملات اللحظي (Fast-Path)
         res = await asyncio.to_thread(system.scan_and_rotate_assets)
 
         if res.get("action") in ["BUY", "SELL"]:
             msg = (
-                f"⚡ **[تنفيذ صفقة مؤسسية - تدوير العملات]**\n\n"
+                f"⚡ **[تنفيذ فوري فائق السرعة - Fast-Path Execution]**\n\n"
                 f"• الزوج المقتنص: `{res['epic']}`\n"
                 f"• الاتجاه: `{res['action']}`\n"
                 f"• السعر: `{res['price']}`\n"
                 f"• حجم العقد: `{res['lots']} Lot`\n"
+                f"• تخصيص HRP الهرمي: `{res.get('hrp_mult', 1.0):.2f}x`\n"
+                f"• شدة قفزات هوكس (Hawkes): `{res.get('hawkes')}` (مستقر)\n"
                 f"• مؤشر هيرست (Hurst): `{res.get('hurst')}` (Trending)\n"
                 f"• مصفوفة القوة: `{res.get('strength')}`\n"
                 f"• مؤشر الدولار: `{res.get('dxy')}`\n"
-                f"• صائد السيولة: `{res.get('sweep')}`\n"
-                f"• فجوة السيولة (FVG): `{res.get('fvg')}`\n"
                 f"• وقف الخسارة الديناميكي: `{res.get('sl_pips')} Pips`\n"
                 f"• جني الأرباح الديناميكي: `{res.get('tp_pips')} Pips`\n"
                 f"• استجابة الوسيط: `{res.get('latency')} ms`\n"
                 f"• انزلاق التنفيذ: `{res.get('slippage')} Pips`\n"
                 f"• احتمالية النجاح (Conformal): `{res['prob']*100:.1f}%`\n"
-                f"• المصادقة البصرية: **معتمدة عبر Kyma ({Config.KYMA_MODEL})**\n"
                 f"• المرجع: `{res.get('deal_ref', 'OK')}`"
                 f"{res.get('slip_alert', '')}"
             )
             await send_priority_message(context, msg, urgent=True)
+
+            # تفعيل المسار الإشرافي البطيء (Slow-Path AI Governor) في الخلفية دون أي تأخير تنفيذي
+            KymaConversationalAgent.async_supervise_position(
+                res['epic'], res['action'], res['price'], context.bot, Config.TELEGRAM_CHAT_ID
+            )
 
         elif res.get("action") == "SIGNAL_DETECTED":
             msg = (
@@ -3206,13 +3281,13 @@ async def job_health_heartbeat(context: ContextTypes.DEFAULT_TYPE):
         TerminalLogger.error("JOB_HEALTH_HEARTBEAT", str(e))
 
 # ==============================================================================
-# 18. نقطة التشغيل الرئيسية لـ Windows وخدمة NSSM
+# 17. نقطة التشغيل الرئيسية لـ Windows وخدمة NSSM
 # ==============================================================================
 if __name__ == "__main__":
     print("\n" + "="*80)
-    print(" 🚀 Quant Institutional Multi-Asset Trading Engine (Kyma AI Integration)")
-    print(f" 🧠 Active LLM Model: {Config.KYMA_MODEL}")
-    print(" 🛡️ Active Safety: Conformal ML | GARCH | Kalman | Hurst | Watchdog | Live Diagnostics")
+    print(" 🚀 Quant Institutional Multi-Asset Trading Engine (v6.0 Institutional Master)")
+    print(f" 🧠 Active LLM Model: {Config.KYMA_MODEL} | Text-to-SQL Quant Engine Enabled")
+    print(" 🛡️ Active Safety: Hawkes Point-Process | HRP | StatArb | Fast-Path Engine")
     print("="*80 + "\n")
     
     setup_crash_dump_handler()
@@ -3233,5 +3308,5 @@ if __name__ == "__main__":
     jq.run_repeating(job_evolution_hourly, interval=3600, first=30)
     jq.run_repeating(job_health_heartbeat, interval=43200, first=3600)
 
-    TerminalLogger.success(f"بدء تشغيل استقبال أوامر تيليجرام ومراقبة السوق المباشرة عبر Kyma AI ({Config.KYMA_MODEL})...")
+    TerminalLogger.success(f"بدء تشغيل محرك التداول المؤسسي بنجاح عبر Kyma AI ({Config.KYMA_MODEL})...")
     app.run_polling()
